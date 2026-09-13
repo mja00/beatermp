@@ -900,7 +900,7 @@ pub fn broadcast_twin(discriminant: u32) -> Option<u32> {
         8 => 9,    // unnamed client request -> its broadcast
         11 => 12,  // SyncCarState -> SyncCarStateBroadcast
         16 => 17,  // CarDeriative -> LobbyChangeCarBroadcast
-        19 => 20,  // unnamed
+        19 => 20,  // "no car selected" -> its broadcast
         25 => 26,  // unnamed
         27 => 28,  // unnamed
         29 => 30,  // UpdateAvatarState -> UpdateAvatarStateBroadcast
@@ -912,6 +912,13 @@ pub fn broadcast_twin(discriminant: u32) -> Option<u32> {
         45 => 48,  // PushCartEnd -> PushCartEndBroadcast
         _ => return None,
     })
+}
+
+/// Whether a host relays a received event *verbatim*, with no `PlayerId`
+/// inserted. `broadcast_equivalent` does this for exactly one variant, `0`,
+/// a `String` (a chat line); every other broadcastable event takes a twin.
+pub fn broadcast_verbatim(discriminant: u32) -> bool {
+    discriminant == 0
 }
 
 /// Host-chosen race options carried in [`Event::StartRace`].

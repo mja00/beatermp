@@ -18,13 +18,14 @@
 //! `Packet` bookkeeping block.
 
 use beatermp_codec::{
-    broadcast_twin, clock_of, decode_car_crossed_finish, decode_crossed_finish, decode_disconnect,
-    decode_player_left, decode_ready, decode_visit_request, encode, encode_car_crossed_finish,
-    encode_garage_commit, encode_garage_visit_broadcast, encode_lobby_change_map,
-    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
-    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
-    encode_with_sender, encode_with_sender_disc, event_kind, parse, CarState, ClientInfo, Event,
-    Frame, Packet, PlayerId, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
+    broadcast_twin, broadcast_verbatim, clock_of, decode_car_crossed_finish, decode_crossed_finish,
+    decode_disconnect, decode_player_left, decode_ready, decode_visit_request, encode,
+    encode_car_crossed_finish, encode_garage_commit, encode_garage_visit_broadcast,
+    encode_lobby_change_map, encode_location_in_garage, encode_player_left, encode_race_end,
+    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
+    encode_visit_garage_response, encode_with_sender, encode_with_sender_disc, event_kind, parse,
+    CarState, ClientInfo, Event, Frame, Packet, PlayerId, Pose, RaceSettings, ServerInfo,
+    CHUNK_SIZE, GREETING_ID,
 };
 
 const FIXTURES: [&str; 9] = [
@@ -839,6 +840,16 @@ fn broadcast_twins_insert_the_sender() {
     assert_eq!(&out[4..8], &sender.client_id.to_le_bytes());
     assert_eq!(&out[12..20], &[1u8; 8]);
     assert_eq!(out.len(), 4 + 8 + 8);
+}
+
+/// A host relays exactly one event verbatim (variant 0, a `String`); every
+/// other non-twin event it consumes, so the server must not forward it.
+#[test]
+fn only_the_string_variant_is_relayed_verbatim() {
+    assert!(broadcast_verbatim(0));
+    for disc in [4, 6, 11, 19, 36, 37, 39] {
+        assert!(!broadcast_verbatim(disc), "{disc} is not relayed verbatim");
+    }
 }
 
 /// `Disconnect` carries a `DisconnectReason` `u32` after the discriminant; the

@@ -42,8 +42,9 @@ unattributed events below (8, 19, 25, 27, 36, 37, 38, 39, 40, 43..48, 0, 9, 20,
    receive switch in `NetworkManager::update` (`switch(uVar49)`, ~line 2020)
    pairs each received event with what it does:
    `16 CarDeriative -> into_car + insert HashMap<ClientId,Car> -> 17`,
-   `19 -> MultiplayerLobby state -> 20`, `21 Ping -> unicast 22 Pong`,
-   `22 Pong -> ignored`, `23 Disconnect -> remove_client -> 24`,
+   `19 -> 20` (19 is what `menu::send_car` sends instead of
+   `CarDeriative(16)` when the player has no car selected), `21 Ping -> unicast
+   22 Pong`, `22 Pong -> ignored`, `23 Disconnect -> remove_client -> 24`,
    `25 -> spawn_player_avatar + insert HashMap<ClientId,AvatarInfo> -> 26`,
    `27 -> 28`, `29 -> 30`, `31 -> 32`, `33 -> Game::form_garage_state_response`,
    `34 -> forwarded to the waiting visitor`, `36 -> a 192-byte
@@ -51,13 +52,14 @@ unattributed events below (8, 19, 25, 27, 36, 37, 38, 39, 40, 43..48, 0, 9, 20,
    `37 -> unicast 38 to one client`, `39 -> apply_car_event -> 40`,
    `41 -> 42`, `43/44/45 -> shared_fn::cart_start / cart_move / cart_end`.
    So only events in `broadcast_equivalent` are ever broadcast, and `37 -> 38`
-   is a *targeted reply* (rightly absent from `broadcast_twin`). For a headless
-   host the twin broadcast, which the generic fallback already emits, is the
-   whole wire effect; the local avatar/cart/spectator state has no client-visible
-   consequence. One residue: the server still relays non-twin client requests
-   such as `36`/`37` verbatim to peers, which a real host never broadcasts
-   (dropping them would be more faithful, but `37`'s reply cannot be built
-   without naming `38`).
+   is a *targeted reply* (rightly absent from `broadcast_twin`). The relay
+   fallback now mirrors that: it re-tags twin events, forwards only the one
+   verbatim event (`broadcast_verbatim`: variant `0`, a `String`), and consumes
+   everything else instead of putting a client-role event on the wire. So `36`
+   (a client's 192-byte `GarageStateCommit`, consumed by the host's case `0x24`)
+   and `37` are dropped rather than relayed. `37`'s unicast `38` reply is not
+   implemented: it is an `InputState::action_got_active` on a string near
+   "Clear avatars", and neither the action nor `38`'s meaning is pinned.
 3. **Host-side rules -- read; the remaining approximations are deliberate for a
    headless host.**
    - RaceEnd: a host sends `3` from `NetworkManager::ui_render` when its player
@@ -177,7 +179,7 @@ fields; `tuple(n)` = `n` fields, with the serde name where it is recoverable.
 | 16 | struct CarDeriative (24) | **the 420-byte client car body** (codec: GarageState) |
 | 17 | tuple(2) | **LobbyChangeCarBroadcast** (`PlayerId`, car; codec: GarageStateCommit) |
 | 18 | tuple(2) | LobbyChangeMap |
-| 19 | unit | |
+| 19 | unit | "no car selected", sent by `menu::send_car` instead of 16 |
 | 20 | newtype ClientId | |
 | 21 | unit | Ping |
 | 22 | unit | Pong |
@@ -194,8 +196,8 @@ fields; `tuple(n)` = `n` fields, with the serde name where it is recoverable.
 | 33 | struct SerKey (2) | RequestVisitGarage (`PlayerId owner`) |
 | 34 | tuple(4) | VisitGarageResponse |
 | 35 | (PlayerId, PlayerId) | garage visit broadcast (codec: GarageVisitBroadcast) |
-| 36 | struct GarageStateCommit (5) | the real 5-field commit type |
-| 37 | newtype ClientId | |
+| 36 | struct GarageStateCommit (5) | client -> host; consumed locally (case `0x24`), never broadcast |
+| 37 | newtype ClientId | client -> host; host unicasts `38` to one client |
 | 38 | newtype ClientId | |
 | 39 | tuple(2) | **CarEvent** (horn/lights; first field is `CarEvent`) |
 | 40 | tuple(3) | **CarEventBroadcast** |

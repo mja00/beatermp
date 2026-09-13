@@ -40,13 +40,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beatermp_codec::{
-    broadcast_twin, clock_of, decode_crossed_finish, decode_disconnect, decode_ready,
-    decode_visit_request, encode, encode_car_crossed_finish, encode_clock, encode_garage_commit,
-    encode_garage_visit_broadcast, encode_lobby_change_map, encode_location_in_garage,
-    encode_player_left, encode_race_end, encode_race_go, encode_ready_broadcast, encode_spawn_car,
-    encode_start_race, encode_visit_garage_response, encode_with_sender, encode_with_sender_disc,
-    event_discriminant, event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame,
-    Packet, PlayerId, PlayerInfo, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
+    broadcast_twin, broadcast_verbatim, clock_of, decode_crossed_finish, decode_disconnect,
+    decode_ready, decode_visit_request, encode, encode_car_crossed_finish, encode_clock,
+    encode_garage_commit, encode_garage_visit_broadcast, encode_lobby_change_map,
+    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
+    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
+    encode_with_sender, encode_with_sender_disc, event_discriminant, event_kind, parse, CarState,
+    Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, RaceSettings,
+    ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -782,6 +783,9 @@ impl Server {
                             "unreliable event {disc} -> broadcast {twin} to {n} peer(s)"
                         ));
                     }
+                    if !broadcast_verbatim(disc) {
+                        return Some(format!("consumed unreliable event {disc} (no twin)"));
+                    }
                 }
                 let n = self.relay_unreliable(from, &payload);
                 match kind {
@@ -989,14 +993,19 @@ impl Server {
             }
 
             // Everything else, including events this server does not model,
-            // is relayed to the other lobby members as a listen server would.
-            // A real host re-tags any client event that has a `*Broadcast`
-            // twin (`encode_with_sender_disc`) instead of forwarding the
-            // client-role event, which no peer expects.
+            // is handled the way a real host does: a client event with a
+            // `*Broadcast` twin is re-tagged with the sender's `PlayerId`
+            // (`encode_with_sender_disc`), and the one verbatim event (the
+            // `String`, variant 0) is forwarded as-is. Any other client event
+            // is consumed, never broadcast -- forwarding the client-role event
+            // would put something no peer expects on the wire.
             _ => {
                 if let Ok(disc) = event_discriminant(&payload) {
                     if let Some((twin, n)) = self.relay_twin(from, disc, &payload) {
                         return Some(format!("event {disc} -> broadcast {twin} to {n} peer(s)"));
+                    }
+                    if !broadcast_verbatim(disc) {
+                        return Some(format!("consumed event {disc} (no broadcast twin)"));
                     }
                 }
                 let n = self.broadcast_reliable(from, payload);
