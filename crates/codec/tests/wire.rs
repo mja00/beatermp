@@ -18,13 +18,13 @@
 //! `Packet` bookkeeping block.
 
 use beatermp_codec::{
-    clock_of, decode_car_crossed_finish, decode_crossed_finish, decode_player_left, decode_ready,
-    decode_visit_request, encode, encode_car_crossed_finish, encode_garage_commit,
-    encode_garage_visit_broadcast, encode_lobby_change_map, encode_location_in_garage,
-    encode_player_left, encode_race_end, encode_race_go, encode_ready_broadcast, encode_spawn_car,
-    encode_start_race, encode_visit_garage_response, encode_with_sender, event_kind, parse,
-    CarState, ClientInfo, Event, Frame, Packet, PlayerId, Pose, RaceSettings, ServerInfo,
-    CHUNK_SIZE, GREETING_ID,
+    broadcast_twin, clock_of, decode_car_crossed_finish, decode_crossed_finish, decode_disconnect,
+    decode_player_left, decode_ready, decode_visit_request, encode, encode_car_crossed_finish,
+    encode_garage_commit, encode_garage_visit_broadcast, encode_lobby_change_map,
+    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
+    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
+    encode_with_sender, encode_with_sender_disc, event_kind, parse, CarState, ClientInfo, Event,
+    Frame, Packet, PlayerId, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 const FIXTURES: [&str; 9] = [
@@ -801,3 +801,58 @@ fn malformed_input_is_rejected() {
     );
     assert!(parse(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]).is_err());
 }
+
+/// The client -> broadcast routing table, read from the binary's
+/// `NetworkEvent::broadcast_equivalent` switch. The broadcast re-tags the body
+/// with the sender's `PlayerId` and nothing else; a host relays no other
+/// client event.
+#[test]
+fn broadcast_twins_insert_the_sender() {
+    assert_eq!(broadcast_twin(6), Some(7)); // Ready
+    assert_eq!(broadcast_twin(11), Some(12)); // SyncCarState
+    assert_eq!(broadcast_twin(16), Some(17)); // CarDeriative
+    assert_eq!(broadcast_twin(29), Some(30)); // UpdateAvatarState
+    assert_eq!(broadcast_twin(31), Some(32)); // UpdateLocation
+    assert_eq!(broadcast_twin(39), Some(40)); // CarEvent
+    assert_eq!(broadcast_twin(41), Some(42)); // StopGarageVisit
+    assert_eq!(broadcast_twin(43), Some(46)); // PushCartStarted
+    assert_eq!(broadcast_twin(44), Some(47)); // PushCartMoved
+    assert_eq!(broadcast_twin(45), Some(48)); // PushCartEnd
+    // Variant 0 (a String) maps to itself *without* the PlayerId, so a host
+    // relays it unchanged rather than re-tagging it.
+    assert_eq!(broadcast_twin(0), None);
+    assert_eq!(
+        broadcast_twin(4),
+        None,
+        "CrossedFinish has no broadcast twin"
+    );
+
+    let sender = PlayerId {
+        client_id: 2,
+        player_index: 1,
+    };
+    // PushCartStarted(43) carries one 8-byte field after the discriminant.
+    let mut payload = 43u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&[1u8; 8]);
+    let out = encode_with_sender_disc(46, sender, &payload);
+    assert_eq!(&out[..4], &46u32.to_le_bytes());
+    assert_eq!(&out[4..8], &sender.client_id.to_le_bytes());
+    assert_eq!(&out[12..20], &[1u8; 8]);
+    assert_eq!(out.len(), 4 + 8 + 8);
+}
+
+/// `Disconnect` carries a `DisconnectReason` `u32` after the discriminant; the
+/// capture has only `0` (a clean quit).
+#[test]
+fn disconnect_carries_a_reason() {
+    let mut found = 0;
+    for (_sent, raw) in fixture("leave_host.txt") {
+        let Some(p) = reliable(&raw) else { continue };
+        if event_kind(&p.payload) == Ok(Event::Disconnect) {
+            assert_eq!(decode_disconnect(&p.payload).unwrap(), 0);
+            found += 1;
+        }
+    }
+    assert!(found > 0, "no Disconnect frame in leave_host.txt");
+}
+

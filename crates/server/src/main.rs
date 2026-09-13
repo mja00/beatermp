@@ -40,13 +40,13 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beatermp_codec::{
-    clock_of, decode_crossed_finish, decode_ready, decode_visit_request, encode,
-    encode_car_crossed_finish, encode_clock, encode_garage_commit, encode_garage_visit_broadcast,
-    encode_lobby_change_map, encode_location_in_garage, encode_player_left, encode_race_end,
-    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
-    encode_visit_garage_response, encode_with_sender, event_kind, parse, CarState, Chunk,
-    ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, RaceSettings, ServerInfo,
-    CHUNK_SIZE, GREETING_ID,
+    broadcast_twin, clock_of, decode_crossed_finish, decode_disconnect, decode_ready,
+    decode_visit_request, encode, encode_car_crossed_finish, encode_clock, encode_garage_commit,
+    encode_garage_visit_broadcast, encode_lobby_change_map, encode_location_in_garage,
+    encode_player_left, encode_race_end, encode_race_go, encode_ready_broadcast, encode_spawn_car,
+    encode_start_race, encode_visit_garage_response, encode_with_sender, encode_with_sender_disc,
+    event_discriminant, event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame,
+    Packet, PlayerId, PlayerInfo, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -74,6 +74,11 @@ const MAPS_TABLE: &str = include_str!("../maps.txt");
 /// (captured host: 0.754 over a spawn at 0.0). Spawning there instead of in
 /// the terrain avoids a physics pop at the grid.
 const SPAWN_LIFT: f32 = 0.75;
+
+/// How far below its grid slot the phantom host car is parked. Deep enough to
+/// be under any terrain, so the host car never blocks a racer; keeping its
+/// x/z on the grid leaves a 2D minimap unchanged.
+const HOST_PARK_DEPTH: f32 = 5000.0;
 
 /// `AvatarState` as every real host and client has sent it; opaque here.
 const AVATAR: [u8; 5] = [0; 5];
@@ -114,10 +119,27 @@ const HOST_CAR_STATE_HEX: &str = concat!(
     "90880045010000000000000001000000000011c58e43",
 );
 
-/// Size of the opaque car state inside `CarState`/`CarStateBroadcast`; it
-/// opens with the 28-byte pose, and `live_host_state` patches two fields by
-/// offset within it.
+/// Size of the car state inside `CarState`/`CarStateBroadcast`.
 const CAR_STATE_LEN: usize = 94;
+
+/// Byte offsets of the two fields `live_host_state` patches, from the layout
+/// recovered out of the binary's `NetworkCarState` deserializer (`0x6ca030`)
+/// and cross-checked against the captured state (offset 84 is `1` while held
+/// at the grid; offset 90 is an f32 clock, `285.54` in the capture). Field
+/// names were stripped from the binary, so these are positional:
+///
+/// ```text
+/// 0..28   pose, `Isometry<f32, UnitQuaternion<f32>, 3>` (rotation xyzw, position xyz)
+/// 28..40  [f32; 3]        40..52  [f32; 3]
+/// 52..64  u32 x3          64..76  f32 x3
+/// 76..84  usize
+/// 84      bool            held at the grid until 3 s after RaceGo
+/// 85      bool
+/// 86..90  f32
+/// 90..94  f32             sender clock
+/// ```
+const CAR_STATE_GRID_HOLD: usize = 84;
+const CAR_STATE_CLOCK: usize = 90;
 
 /// Cadence of `CarState` traffic in the capture.
 const CAR_STATE_INTERVAL: Duration = Duration::from_millis(50);
@@ -214,6 +236,17 @@ impl Map {
     /// wraps onto the first points; the game itself caps lobbies per map.
     fn grid_pose(&self, slot: usize) -> Pose {
         self.spawns[slot % self.spawns.len()]
+    }
+
+    /// Where the phantom host car is parked: the grid slot *after* every racer
+    /// (the host nominally takes the last slot), moved straight down. x/z stay
+    /// on the grid (so a 2D minimap is unaffected) while the car sits far under
+    /// the terrain, out of the racing line all race -- a car parked *on* the
+    /// grid would still be driven into every lap.
+    fn parking_pose(&self, slot: usize) -> Pose {
+        let mut pose = self.grid_pose(slot);
+        pose[5] -= HOST_PARK_DEPTH;
+        pose
     }
 }
 
@@ -383,15 +416,19 @@ impl Server {
         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
         let start = encode_start_race(&self.map().name, self.map().variant, &self.settings);
         let host_garage = decode_hex(HOST_GARAGE_HEX);
-        let host_pose = self.map().grid_pose(0);
+        // Clients take the front grid slots; the phantom host nominally takes
+        // the last one, parked under the terrain. A client only accepts a race
+        // with a host car present, but nothing needs it on the racing line.
+        let client_count = self.clients.values().filter(|c| c.garage.is_some()).count();
+        let host_pose = self.map().parking_pose(client_count);
         let mut spawns = vec![encode_spawn_car(
             PlayerId::HOST,
             HOST_ENTITY,
             &host_garage,
             &host_pose,
         )];
-        // The captured state has the capture's grid position baked in; a
-        // client spawned there would be inside the phantom and explode.
+        // The captured state has the capture's grid position baked in; patch in
+        // the parked pose so the streamed host stays off the track too.
         let mut host_state = decode_hex(HOST_CAR_STATE_HEX);
         let pose_at = host_state.len() - CAR_STATE_LEN;
         for (i, f) in host_pose.iter().enumerate() {
@@ -411,7 +448,7 @@ impl Server {
                 c.id,
                 c.entity(),
                 garage,
-                &self.map().grid_pose(slot + 1),
+                &self.map().grid_pose(slot),
             ));
         }
         let targets = self.lobby_peers(None);
@@ -441,16 +478,15 @@ impl Server {
     /// sender clock and a "held at grid" flag that clears 3 s after RaceGo;
     /// a frozen copy left clients drawing the host as loose wheels.
     fn live_host_state(&self) -> Vec<u8> {
-        const GRID_FLAG: usize = 84;
-        const CLOCK: usize = 90;
         let mut payload = self.host_state.clone();
         let state_at = payload.len() - CAR_STATE_LEN;
         let held = self
             .race_go_at
             .is_none_or(|t| t.elapsed() < Duration::from_secs(3));
-        payload[state_at + GRID_FLAG..state_at + GRID_FLAG + 4]
-            .copy_from_slice(&(held as u32).to_le_bytes());
-        payload[state_at + CLOCK..state_at + CLOCK + 4]
+        // Offset 84 is a bool; patching four bytes there would also overwrite
+        // the low half of the f32 at 86.
+        payload[state_at + CAR_STATE_GRID_HOLD] = held as u8;
+        payload[state_at + CAR_STATE_CLOCK..state_at + CAR_STATE_CLOCK + 4]
             .copy_from_slice(&self.started.elapsed().as_secs_f32().to_le_bytes());
         payload
     }
@@ -740,6 +776,13 @@ impl Server {
                 None
             }
             kind => {
+                if let Ok(disc) = event_discriminant(&payload) {
+                    if let Some((twin, n)) = self.relay_twin(from, disc, &payload) {
+                        return Some(format!(
+                            "unreliable event {disc} -> broadcast {twin} to {n} peer(s)"
+                        ));
+                    }
+                }
                 let n = self.relay_unreliable(from, &payload);
                 match kind {
                     Ok(k) => Some(format!("relayed unreliable {k:?} to {n} peer(s)")),
@@ -883,8 +926,11 @@ impl Server {
             Ok(Event::Disconnect) => {
                 // A real host also keeps retransmitting PlayerLeft to the
                 // leaver, which never acks; dropping it here is equivalent.
+                // The body is a DisconnectReason (0 none, 1 kick, 2 timed_out,
+                // 3 host_left, 4 ban, 5 player_limit); every capture is 0.
+                let reason = decode_disconnect(&payload).unwrap_or(0);
                 self.remove_client(from, "disconnected");
-                Some("disconnect -> player left".to_string())
+                Some(format!("disconnect (reason {reason}) -> player left"))
             }
 
             Ok(Event::RequestVisitGarage) => {
@@ -944,7 +990,15 @@ impl Server {
 
             // Everything else, including events this server does not model,
             // is relayed to the other lobby members as a listen server would.
+            // A real host re-tags any client event that has a `*Broadcast`
+            // twin (`encode_with_sender_disc`) instead of forwarding the
+            // client-role event, which no peer expects.
             _ => {
+                if let Ok(disc) = event_discriminant(&payload) {
+                    if let Some((twin, n)) = self.relay_twin(from, disc, &payload) {
+                        return Some(format!("event {disc} -> broadcast {twin} to {n} peer(s)"));
+                    }
+                }
                 let n = self.broadcast_reliable(from, payload);
                 match kind {
                     Ok(k) => Some(format!("relayed {k:?} to {n} peer(s)")),
@@ -993,6 +1047,21 @@ impl Server {
             self.send_reliable(*addr, payload.clone(), true);
         }
         targets.len()
+    }
+
+    /// If `disc` is a client event with a `*Broadcast` twin, re-tag it with the
+    /// sender's `PlayerId` and send it to the other lobby members. Returns the
+    /// twin and how many peers it went to, or `None` when the event has no twin
+    /// (the host would not broadcast it) or the sender is not in the lobby.
+    ///
+    /// Both the reliable and the unreliable receive paths use this: the output
+    /// is what the host's `broadcast_equivalent` would produce, regardless of
+    /// how the client frame arrived.
+    fn relay_twin(&mut self, from: SocketAddr, disc: u32, payload: &[u8]) -> Option<(u32, usize)> {
+        let twin = broadcast_twin(disc)?;
+        let id = self.clients.get(&from).filter(|c| c.garage.is_some())?.id;
+        let n = self.broadcast_reliable(from, encode_with_sender_disc(twin, id, payload));
+        Some((twin, n))
     }
 
     fn relay_unreliable(&self, from: SocketAddr, payload: &[u8]) -> usize {

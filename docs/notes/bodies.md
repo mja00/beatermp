@@ -385,25 +385,48 @@ e43f3f0400000000000000010a3d20d21a7c7a40010a3d20d21a7c7a40010a3d20d21a7c7a
 
 ## NetworkEvent variant discriminants pinned from the binary
 
+> **Correction (later pass, `tools/re/network_events.py`).** The full enum is
+> now recovered from the binary: 49 variants, discriminant == declaration
+> index. Several names below were descriptive and turned out to be the wrong
+> serde name: `16` is `CarDeriative` (the client's car body, not a hypothetical
+> `GarageState`), `17` is `LobbyChangeCarBroadcast` (`PlayerId` + that car body,
+> not `GarageStateCommit`), `10` is `SpawnCarBroadcast`, `11`/`12` are
+> `SyncCarState`/`SyncCarStateBroadcast`, `13` is `ClientConnected`, and `7` is
+> `PlayerSetStatusBroadcast`. A real `GarageStateCommit` (5 fields) is variant
+> `36`. See `docs/notes/parity.md` for the complete table. The bytes and roles
+> in this document are unchanged.
+
 Observed directly in captures (both fixtures, kind0 Data payloads):
 
 | Name | Discriminant (u32) | Confidence |
 |---|---|---|
 | ServerInfo | 14 | PROVEN |
 | ClientInfo | 15 | PROVEN |
-| GarageState | 16 | PROVEN |
-| GarageStateCommit | 17 | PROVEN |
+| CarDeriative | 16 | PROVEN (codec calls it `GarageState`; 420-byte car body, 24 serde fields) |
+| LobbyChangeCarBroadcast | 17 | PROVEN (codec calls it `GarageStateCommit`; `PlayerId` + the same 420-byte body) |
 | LobbyChangeMap | 18 | PROVEN (`race_settings_host.txt`: `[18][map][u32 variant]`, ordered; Default=1, Reverse=2 observed, so the `VariantName` enum is 1-based on the wire) |
 | CrossedFinish | 4 | PROVEN (`finish_host.txt`; binary says "2 elements": `Entity`, `f64`) |
 | CarCrossedFinish | 5 | PROVEN (`finish_host.txt`; "3 elements": `PlayerId`, `Entity`, `f64`) |
-| (RaceEnd) | 3 | body `u8 1`, host -> clients when the host leaves the finish overlay; real variant name not recovered |
-| (CPU SpawnCar) | 10 | a real host spawns CPU opponents as SpawnCars with the leading `u32 1` instead of `0` and `PlayerId (n, 0)`; it simulates them itself |
+| (RaceEnd) | 3 | body `u8 1`, host -> clients when the host leaves the finish overlay; binary shape `newtype bool`, real variant name not recovered |
+| SpawnCarBroadcast | 10 | PROVEN name; a real host spawns CPU opponents with the leading `CarOwner` = 1 instead of `0` and `PlayerId (n, 0)`; it simulates them itself |
+| SyncCarState / SyncCarStateBroadcast | 11 / 12 | PROVEN names; codec calls them `CarState`/`CarStateBroadcast` |
+| ClientConnected | 13 | PROVEN name; codec calls it `PlayerJoined` |
+| PlayerSetStatusBroadcast | 7 | PROVEN name; codec calls it `ReadyBroadcast` |
 | UpdateAvatarState / UpdateAvatarStateBroadcast | 29 / 30 | PROVEN (`garage_visit_host.txt`; 48-byte avatar pose, broadcast prepends `PlayerId`) |
 | UpdateLocation / UpdateLocationBroadcast | 31 / 32 | PROVEN (`u32` location tag; host emits `2` + owner `PlayerId` for "in a garage") |
 | RequestVisitGarage | 33 | PROVEN (body: owner `PlayerId`) |
 | VisitGarageResponse | 34 | PROVEN ("4 elements": 32-byte prefix, garage body, 240-byte scene, owner `PlayerId`, then 8 zero bytes; no visitor id) |
 | (garage visit broadcast) | 35 | body `PlayerId visitor, PlayerId owner`; real variant name not recovered |
 | StopGarageVisit / StopGarageVisitBroadcast | 41 / 42 | PROVEN (unit body; broadcast carries the visitor `PlayerId`) |
+| CarEvent / CarEventBroadcast | 39 / 40 | PROVEN names (never captured; "2"/"3 elements") |
+| PushCartStarted / PushCartStartedBroadcast | 43 / 46 | PROVEN pair from `broadcast_equivalent` (43 and 45 have no tuple-name string) |
+| PushCartMoved / PushCartMovedBroadcast | 44 / 47 | PROVEN names (never captured) |
+| PushCartEnd / PushCartEndBroadcast | 45 / 48 | PROVEN pair from `broadcast_equivalent` |
+| (unnamed client requests and their broadcasts) | 8 / 19 / 25 / 27 -> 9 / 20 / 26 / 28 | bodyless; the broadcast is the bare `PlayerId` |
+
+`NetworkEvent::broadcast_equivalent` also confirms the transform for every
+client -> host event that has a broadcast twin (the sender's `PlayerId` is
+inserted after the discriminant, body verbatim); see `docs/notes/parity.md`.
 
 `Entity` is bevy's `(u32 index, u32 generation)`, the same pair SpawnCar and
 CarState carry. Race time is the `f64` shown in the results table (9.224 and

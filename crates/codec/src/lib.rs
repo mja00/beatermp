@@ -71,9 +71,15 @@ pub const CHUNK_SIZE: usize = 450;
 
 /// `NetworkEvent` discriminants observed on the wire.
 ///
-/// The enum has at least 49 variants (serde's `variant index 0 <= i < 49`
-/// panic string). Only the ones seen in captures are named; the role column
+/// The enum has exactly 49 variants, discriminants `0..=48` in declaration
+/// order (`tools/re/network_events.py` reads the deserialiser's jump table from
+/// the binary). Only the ones seen in captures are named; the role column
 /// is inferred from when each appeared and what the UI did in response.
+///
+/// The binary's own serde names differ from some of the descriptive names
+/// below; the recovered ones are `7 PlayerSetStatusBroadcast`,
+/// `10 SpawnCarBroadcast`, `11 SyncCarState`, `12 SyncCarStateBroadcast`,
+/// `13 ClientConnected`, `16 CarDeriative` and `17 LobbyChangeCarBroadcast`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Event {
@@ -157,6 +163,28 @@ pub enum Event {
     StopGarageVisit = 41,
     /// Host -> the other clients: the visitor's [`PlayerId`].
     StopGarageVisitBroadcast = 42,
+    /// Client -> host: a cosmetic car action (horn, lights, ...); two
+    /// elements, the first a `CarEvent`. Recovered name, never captured.
+    CarEvent = 39,
+    /// Host -> the other clients: `CarEvent` re-tagged with the sender's
+    /// [`PlayerId`] (three elements).
+    CarEventBroadcast = 40,
+    /// Client -> host: a push-cart started moving; one element. Recovered
+    /// name (it has no serde tuple-name string, so the binary's
+    /// `broadcast_equivalent` is the evidence: `43 -> 46`).
+    PushCartStarted = 43,
+    /// Client -> host: a push-cart moved; two elements. Recovered name.
+    PushCartMoved = 44,
+    /// Client -> host: a push-cart stopped; one element. Recovered name
+    /// (`broadcast_equivalent` maps `45 -> 48`).
+    PushCartEnd = 45,
+    /// Host -> the other clients: a push-cart started moving, two elements.
+    PushCartStartedBroadcast = 46,
+    /// Host -> the other clients: `PushCartMoved` re-tagged with the sender's
+    /// [`PlayerId`] (three elements).
+    PushCartMovedBroadcast = 47,
+    /// Host -> the other clients: a push-cart stopped, two elements.
+    PushCartEndBroadcast = 48,
 }
 
 impl Event {
@@ -191,6 +219,14 @@ impl Event {
             35 => Event::GarageVisitBroadcast,
             41 => Event::StopGarageVisit,
             42 => Event::StopGarageVisitBroadcast,
+            39 => Event::CarEvent,
+            40 => Event::CarEventBroadcast,
+            43 => Event::PushCartStarted,
+            44 => Event::PushCartMoved,
+            45 => Event::PushCartEnd,
+            46 => Event::PushCartStartedBroadcast,
+            47 => Event::PushCartMovedBroadcast,
+            48 => Event::PushCartEndBroadcast,
             _ => return None,
         })
     }
@@ -705,6 +741,16 @@ pub fn decode_ready(payload: &[u8]) -> Result<bool> {
     Ok(c.u8()? != 0)
 }
 
+/// Decode the `DisconnectReason` a client sends in [`Event::Disconnect`]:
+/// `0` none, `1` kick, `2` timed_out, `3` host_left, `4` ban, `5` player_limit
+/// (from `<DisconnectReason>::display`, binary `0x3d63c0`). Captures show only
+/// `0`; a host answers any of them with `PlayerLeft`.
+pub fn decode_disconnect(payload: &[u8]) -> Result<u32> {
+    let mut c = Cursor::new(payload);
+    expect_event(&mut c, Event::Disconnect, "Disconnect")?;
+    c.u32()
+}
+
 /// Encode a [`Event::ReadyBroadcast`] for the given player.
 pub fn encode_ready_broadcast(id: PlayerId, ready: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(13);
@@ -820,12 +866,52 @@ pub fn encode_location_in_garage(id: PlayerId, owner: PlayerId) -> Vec<u8> {
 /// [`PlayerId`] after the discriminant; the body is carried verbatim. Used
 /// for `UpdateAvatarState`, `UpdateLocation` and `StopGarageVisit`.
 pub fn encode_with_sender(broadcast: Event, id: PlayerId, payload: &[u8]) -> Vec<u8> {
+    encode_with_sender_disc(broadcast as u32, id, payload)
+}
+
+/// Like [`encode_with_sender`] but with a raw discriminant, for the twins of
+/// events this crate has not named.
+pub fn encode_with_sender_disc(broadcast: u32, id: PlayerId, payload: &[u8]) -> Vec<u8> {
     let body = payload.get(4..).unwrap_or(&[]);
     let mut out = Vec::with_capacity(12 + body.len());
-    out.extend_from_slice(&(broadcast as u32).to_le_bytes());
+    out.extend_from_slice(&broadcast.to_le_bytes());
     id.write(&mut out);
     out.extend_from_slice(body);
     out
+}
+
+/// The leading `u32` discriminant of a `NetworkEvent` payload, named or not.
+pub fn event_discriminant(payload: &[u8]) -> Result<u32> {
+    Cursor::new(payload).u32()
+}
+
+/// The `*Broadcast` twin of a client -> host event, read from the binary's
+/// `<NetworkEvent>::broadcast_equivalent` switch (0x4d67a0).
+///
+/// A real host does not forward these client-role events; it re-tags each one
+/// for the rest of the lobby, inserting the sender's `PlayerId` after the
+/// discriminant and carrying the body verbatim (see [`encode_with_sender_disc`]).
+/// Discriminants absent here have no twin: the host handles them locally and
+/// `broadcast_equivalent` would panic. Variant `0` (a `String`) maps to itself
+/// *without* the `PlayerId`, so it is not listed and is relayed unchanged.
+pub fn broadcast_twin(discriminant: u32) -> Option<u32> {
+    Some(match discriminant {
+        6 => 7,    // Ready -> PlayerSetStatusBroadcast
+        8 => 9,    // unnamed client request -> its broadcast
+        11 => 12,  // SyncCarState -> SyncCarStateBroadcast
+        16 => 17,  // CarDeriative -> LobbyChangeCarBroadcast
+        19 => 20,  // unnamed
+        25 => 26,  // unnamed
+        27 => 28,  // unnamed
+        29 => 30,  // UpdateAvatarState -> UpdateAvatarStateBroadcast
+        31 => 32,  // UpdateLocation -> UpdateLocationBroadcast
+        39 => 40,  // CarEvent -> CarEventBroadcast
+        41 => 42,  // StopGarageVisit -> StopGarageVisitBroadcast
+        43 => 46,  // PushCartStarted -> PushCartStartedBroadcast
+        44 => 47,  // PushCartMoved -> PushCartMovedBroadcast
+        45 => 48,  // PushCartEnd -> PushCartEndBroadcast
+        _ => return None,
+    })
 }
 
 /// Host-chosen race options carried in [`Event::StartRace`].

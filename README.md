@@ -95,12 +95,15 @@ track with LobbyChangeMap, exactly as a real host's Change Map does, so the
 lobby minimap follows the rotation. `--laps`, `--night` and `--rain` set the
 race settings a real host picks in its Race Settings panel.
 
-Limits: the host car is a parked phantom on grid slot 0 (a client only accepts
-a race with a host car present); its car state is a captured constant with
-the pose, grid flag and clock patched live, and it "finishes" 1 ms behind the
-last real finisher so the results table has no empty row. CPU opponents are
-not supported: a real host spawns them as extra SpawnCars (leading `u32 1`)
-and simulates them itself, which needs the game's physics.
+Limits: the host car is a parked phantom. Clients take the front grid slots;
+the host nominally takes the last one but is spawned far below the terrain, so
+it is never on the racing line (a car parked on the grid would be driven into
+every lap). A client only accepts a race with a host car present, so it must
+exist. Its car state is a captured constant with the pose, grid flag and clock
+patched live, and it "finishes" 1 ms behind the last real finisher so the
+results table has no empty row. CPU opponents are not supported: a real host
+spawns them as extra SpawnCars (leading `u32 1`) and simulates them itself,
+which needs the game's physics.
 
 ## Protocol
 
@@ -197,7 +200,9 @@ the host re-tags as UpdateAvatarStateBroadcast for the others. Leaving for the
 hub sends UpdateLocation(0) and StopGarageVisit, both re-tagged with the
 sender's `PlayerId`.
 
-`docs/notes/bodies.md` has the byte-level walk of the GarageState body.
+`docs/notes/bodies.md` has the byte-level walk of the GarageState body;
+`docs/notes/parity.md` lists what still differs from a real host and how to
+close it.
 
 ## Tools
 
@@ -211,6 +216,12 @@ sender's `PlayerId`.
 - `tools/re/frames.py <capture> [--fd N] [--no-hb] [--kinds]`: annotated frame
   listing of a capture.
 - `tools/re/extract_fields.py <binary>`: recovers serde field-name tables.
+- `tools/re/network_events.py <binary>`: recovers every `NetworkEvent` variant
+  from the binary -- discriminant, body shape and tuple-variant name (see
+  `docs/notes/parity.md`).
+- `tools/re/export_decomp.py`: decompiles chosen functions out of a Ghidra
+  project via PyGhidra (the Java post-script route does not work in this build);
+  usage and the one-time venv setup are in the file header.
 - `tools/re/spawns.py [game_dir] > crates/server/maps.txt`: regenerates the
   baked per-variant grid-pose table.
 
