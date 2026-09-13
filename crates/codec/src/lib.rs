@@ -126,6 +126,34 @@ pub enum Event {
     Disconnect = 23,
     /// Host -> lobby members: a player left, body is its [`PlayerId`].
     PlayerLeft = 24,
+    /// Client -> host, Unreliable, ~100 Hz while walking around in another
+    /// player's garage: 48-byte avatar state (pose, ending in the sender's
+    /// clock). Carried verbatim.
+    UpdateAvatarState = 29,
+    /// Host -> the other clients, reliable, throttled to ~20 Hz: `(PlayerId,
+    /// avatar state)`.
+    UpdateAvatarStateBroadcast = 30,
+    /// Client -> host: where the player went; `u32` tag, only `0` (back in
+    /// the lobby or hub, not visiting) observed from clients.
+    UpdateLocation = 31,
+    /// Host -> the other clients: `(PlayerId, location)`. The host itself
+    /// emits tag `2` followed by the owner's [`PlayerId`] when a player
+    /// enters someone's garage.
+    UpdateLocationBroadcast = 32,
+    /// Client -> host: the player clicked "Visit garage" under the owner's
+    /// car; body is the owner's [`PlayerId`]. Any client that receives one
+    /// answers with a `VisitGarageResponse`, whoever it names.
+    RequestVisitGarage = 33,
+    /// Owner -> visitor, via the host, ~712 bytes so chunked: the owner's
+    /// garage, see [`encode_visit_garage_response`].
+    VisitGarageResponse = 34,
+    /// Host -> the other clients when it answered a visit:
+    /// `(visitor PlayerId, owner PlayerId)`. Descriptive name.
+    GarageVisitBroadcast = 35,
+    /// Client -> host when it leaves a visited garage for the hub. No body.
+    StopGarageVisit = 41,
+    /// Host -> the other clients: the visitor's [`PlayerId`].
+    StopGarageVisitBroadcast = 42,
 }
 
 impl Event {
@@ -150,6 +178,15 @@ impl Event {
             22 => Event::Pong,
             23 => Event::Disconnect,
             24 => Event::PlayerLeft,
+            29 => Event::UpdateAvatarState,
+            30 => Event::UpdateAvatarStateBroadcast,
+            31 => Event::UpdateLocation,
+            32 => Event::UpdateLocationBroadcast,
+            33 => Event::RequestVisitGarage,
+            34 => Event::VisitGarageResponse,
+            35 => Event::GarageVisitBroadcast,
+            41 => Event::StopGarageVisit,
+            42 => Event::StopGarageVisitBroadcast,
             _ => return None,
         })
     }
@@ -702,6 +739,88 @@ pub fn decode_player_left(payload: &[u8]) -> Result<PlayerId> {
     let mut c = Cursor::new(payload);
     expect_event(&mut c, Event::PlayerLeft, "PlayerLeft")?;
     PlayerId::read(&mut c)
+}
+
+/// Decode a client's [`Event::RequestVisitGarage`]: the garage owner.
+pub fn decode_visit_request(payload: &[u8]) -> Result<PlayerId> {
+    let mut c = Cursor::new(payload);
+    expect_event(&mut c, Event::RequestVisitGarage, "RequestVisitGarage")?;
+    PlayerId::read(&mut c)
+}
+
+/// Words between the discriminant and the garage body in every captured
+/// `VisitGarageResponse`, identical for two different owners; meaning unknown.
+const VISIT_RESPONSE_PREFIX: [u8; 32] = [
+    1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0,
+];
+
+/// Garage scene state that follows the garage body: identical for two
+/// different owners with untouched garages (parts on the shelves, a default
+/// rim), so it is replayed verbatim.
+const VISIT_RESPONSE_SCENE: [u8; 240] = [
+    0x00, 0x00, 0x00, 0x80, 0xf3, 0x04, 0x35, 0x3f, 0x00, 0x00, 0x00, 0x80, 0xf3, 0x04, 0x35, 0x3f,
+    0x00, 0x00, 0x10, 0xc1, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x60, 0xe5, 0xbb, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd4, 0xfb, 0x56, 0xbf, 0x00, 0x00, 0x00, 0x80,
+    0x3e, 0xfd, 0x0a, 0x3f, 0x4b, 0x4c, 0xd6, 0xbf, 0xae, 0x47, 0xe1, 0x3d, 0x54, 0x0c, 0x54, 0x3f,
+    0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xfe, 0xda, 0x4e, 0xbf, 0x00, 0x00, 0x00, 0x80, 0x0e, 0xd2, 0x16, 0x3f,
+    0x36, 0xec, 0xca, 0xbf, 0x00, 0x00, 0x00, 0x00, 0x23, 0x77, 0x06, 0x3f, 0x04, 0x00, 0x00, 0x00,
+    0x52, 0xb8, 0x1e, 0x85, 0xeb, 0x51, 0xd8, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+    0x66, 0x66, 0x0e, 0xc1, 0xcd, 0xcc, 0xec, 0x3f, 0x9a, 0x99, 0x19, 0xc0, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x69, 0x6d, 0x5f, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Encode an [`Event::VisitGarageResponse`] for `owner`'s garage, given its
+/// `GarageState` payload (discriminant included). Layout, from two captured
+/// responses: prefix, garage body, garage scene, owner id, eight zero bytes.
+/// The visitor is not named; the host remembers who asked.
+pub fn encode_visit_garage_response(owner: PlayerId, garage_state: &[u8]) -> Vec<u8> {
+    let body = garage_state.get(4..).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(300 + body.len());
+    out.extend_from_slice(&(Event::VisitGarageResponse as u32).to_le_bytes());
+    out.extend_from_slice(&VISIT_RESPONSE_PREFIX);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&VISIT_RESPONSE_SCENE);
+    owner.write(&mut out);
+    out.extend_from_slice(&[0; 8]);
+    out
+}
+
+/// Encode an [`Event::GarageVisitBroadcast`]: `visitor` entered `owner`'s garage.
+pub fn encode_garage_visit_broadcast(visitor: PlayerId, owner: PlayerId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.extend_from_slice(&(Event::GarageVisitBroadcast as u32).to_le_bytes());
+    visitor.write(&mut out);
+    owner.write(&mut out);
+    out
+}
+
+/// Encode an [`Event::UpdateLocationBroadcast`] placing `id` in `owner`'s
+/// garage, as a real host does right after answering a visit.
+pub fn encode_location_in_garage(id: PlayerId, owner: PlayerId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&(Event::UpdateLocationBroadcast as u32).to_le_bytes());
+    id.write(&mut out);
+    out.extend_from_slice(&2u32.to_le_bytes());
+    owner.write(&mut out);
+    out
+}
+
+/// Re-tag a client event as its `*Broadcast` twin by inserting the sender's
+/// [`PlayerId`] after the discriminant; the body is carried verbatim. Used
+/// for `UpdateAvatarState`, `UpdateLocation` and `StopGarageVisit`.
+pub fn encode_with_sender(broadcast: Event, id: PlayerId, payload: &[u8]) -> Vec<u8> {
+    let body = payload.get(4..).unwrap_or(&[]);
+    let mut out = Vec::with_capacity(12 + body.len());
+    out.extend_from_slice(&(broadcast as u32).to_le_bytes());
+    id.write(&mut out);
+    out.extend_from_slice(body);
+    out
 }
 
 /// Encode an [`Event::StartRace`] for `map`.

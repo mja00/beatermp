@@ -7,7 +7,7 @@ Linux binary and live packet captures:
 1. **Headless real client** (works today, including races): run the game under
    a virtual X display, click through Host Multiplayer once, leave it running.
 2. **`beatermp`**, a standalone UDP server in this repo that speaks the game's
-   protocol (lobby only: join, garage sync, ready toggles, leave).
+   protocol (lobby, garage visits and racing, with a phantom host car).
 
 ## What the game gives you
 
@@ -78,7 +78,12 @@ is no Start Race button on a client), each client's car state is relayed to
 the others at 20 Hz, the countdown runs once everyone has confirmed at the
 grid, finishes are relayed, and the race ends (results notepad, back to the
 lobby, garage re-sync) once everyone has finished, 180 s after the first
-finish, or when the lobby empties. Races can be run back to back.
+finish, or when the lobby empties. Races can be run back to back; a racer who
+disconnects mid-race is dropped from the finish count, and a client that joins
+mid-race waits in the lobby until the next race. Garage visits work too:
+"Visit garage" under the phantom host shows its stock garage, under another
+player it fetches that player's garage through the server, and the visitor's
+avatar, location and return to the hub are relayed to the others.
 
 Maps: `--map` picks any scene the game can race (repeat it for a rotation that
 advances after each race). Grid poses come from `crates/server/maps.txt`, which
@@ -87,9 +92,10 @@ needs no game install. Only StartRace carries the map name, so after a rotation
 the lobby keeps showing the previous minimap until the next race loads.
 
 Limits: the host car is a parked phantom on grid slot 0 (a client only accepts
-a race with a host car present) that "finishes" with the last real finisher's
-time so the results table has no empty row; race settings and variant are the
-captured defaults (one lap).
+a race with a host car present); its car state is a captured constant with
+the pose, grid flag and clock patched live, and it "finishes" 1 ms behind the
+last real finisher so the results table has no empty row. Race settings and
+variant are the captured defaults (one lap).
 
 ## Protocol
 
@@ -137,6 +143,15 @@ count from `(1, 1)`.
 | 22 | Pong | both | `f32` echo |
 | 23 | Disconnect | client -> host | `u32 0` |
 | 24 | PlayerLeft | host -> all | `PlayerId` |
+| 29 | UpdateAvatarState | client -> host | 48-byte avatar pose ending in the clock; unreliable, ~100 Hz while visiting a garage |
+| 30 | UpdateAvatarStateBroadcast | host -> others | `PlayerId`, avatar pose; reliable, ~20 Hz |
+| 31 | UpdateLocation | client -> host | `u32 location`, only `0` seen (hub/lobby) |
+| 32 | UpdateLocationBroadcast | host -> others | `PlayerId`, `u32 location`; the host emits `2, PlayerId owner` when a player enters a garage |
+| 33 | RequestVisitGarage | client -> host | `PlayerId owner`; a client answers any request it receives |
+| 34 | VisitGarageResponse | owner -> visitor via host | 32-byte prefix, garage body, 240-byte garage scene, `PlayerId owner`, 8 zero bytes; 712 bytes, chunked. Does not name the visitor |
+| 35 | (garage visit broadcast) | host -> others | `PlayerId visitor`, `PlayerId owner` |
+| 41 | StopGarageVisit | client -> host | no body; visitor left for the hub |
+| 42 | StopGarageVisitBroadcast | host -> others | `PlayerId visitor` |
 
 Join sequence as a real host does it:
 
@@ -166,6 +181,15 @@ last):
 5. When the host player leaves the finish overlay it sends RaceEnd and a fresh
    GarageStateCommit of its garage, both ordered; every client answers with its
    worn GarageState. `beatermp` sends RaceEnd 5 s after the last finish.
+
+Garage visit, as a real host does it: the visitor sends RequestVisitGarage;
+the host answers with a VisitGarageResponse for its own garage (or forwards
+the request to the owner and relays the owner's response back), then tells
+everyone else with event 35 and an UpdateLocationBroadcast placing the visitor
+in that garage. While visiting, the client streams UpdateAvatarState, which
+the host re-tags as UpdateAvatarStateBroadcast for the others. Leaving for the
+hub sends UpdateLocation(0) and StopGarageVisit, both re-tagged with the
+sender's `PlayerId`.
 
 `docs/notes/bodies.md` has the byte-level walk of the GarageState body.
 

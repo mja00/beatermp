@@ -393,6 +393,12 @@ Observed directly in captures (both fixtures, kind0 Data payloads):
 | CrossedFinish | 4 | PROVEN (`finish_host.txt`; binary says "2 elements": `Entity`, `f64`) |
 | CarCrossedFinish | 5 | PROVEN (`finish_host.txt`; "3 elements": `PlayerId`, `Entity`, `f64`) |
 | (RaceEnd) | 3 | body `u8 1`, host -> clients when the host leaves the finish overlay; real variant name not recovered |
+| UpdateAvatarState / UpdateAvatarStateBroadcast | 29 / 30 | PROVEN (`garage_visit_host.txt`; 48-byte avatar pose, broadcast prepends `PlayerId`) |
+| UpdateLocation / UpdateLocationBroadcast | 31 / 32 | PROVEN (`u32` location tag; host emits `2` + owner `PlayerId` for "in a garage") |
+| RequestVisitGarage | 33 | PROVEN (body: owner `PlayerId`) |
+| VisitGarageResponse | 34 | PROVEN ("4 elements": 32-byte prefix, garage body, 240-byte scene, owner `PlayerId`, then 8 zero bytes; no visitor id) |
+| (garage visit broadcast) | 35 | body `PlayerId visitor, PlayerId owner`; real variant name not recovered |
+| StopGarageVisit / StopGarageVisitBroadcast | 41 / 42 | PROVEN (unit body; broadcast carries the visitor `PlayerId`) |
 
 `Entity` is bevy's `(u32 index, u32 generation)`, the same pair SpawnCar and
 CarState carry. Race time is the `f64` shown in the results table (9.224 and

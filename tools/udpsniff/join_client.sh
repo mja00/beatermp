@@ -53,7 +53,8 @@ click_at() {
     sleep 0.4
     DISPLAY=$DISPLAY_NO xdotool click 1
 }
-joined() { ss -aun 2>/dev/null | grep -q ":$PORT "; }
+# Match on this client's pid so a second client is not fooled by the first.
+joined() { ss -aunp 2>/dev/null | grep ":$PORT " | grep -q "pid=$(cat "$OUT/client.pid"),"; }
 
 # Ready once the window exists and the asset-loading log has gone quiet; the
 # "Steam Input" marker only appears when Steam is not running.

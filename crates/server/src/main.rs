@@ -30,7 +30,7 @@
 //! ```
 //!
 //! It does not simulate anything: the host car is a parked phantom that
-//! "finishes" with the last real finisher's time so the results table is
+//! "finishes" just behind the last real finisher so the results table is
 //! complete, and a race also ends when a grace period after the first finish
 //! runs out or the lobby empties.
 
@@ -40,11 +40,12 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beatermp_codec::{
-    clock_of, decode_crossed_finish, decode_ready, encode, encode_car_crossed_finish, encode_clock,
-    encode_garage_commit, encode_player_left, encode_race_end, encode_race_go,
-    encode_ready_broadcast, encode_spawn_car, encode_start_race, event_kind, parse, CarState,
-    Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, ServerInfo,
-    CHUNK_SIZE, GREETING_ID,
+    clock_of, decode_crossed_finish, decode_ready, decode_visit_request, encode,
+    encode_car_crossed_finish, encode_clock, encode_garage_commit, encode_garage_visit_broadcast,
+    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
+    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
+    encode_with_sender, event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame,
+    Packet, PlayerId, PlayerInfo, Pose, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -102,8 +103,9 @@ const HOST_GARAGE_HEX: &str = concat!(
 const HOST_ENTITY: u32 = 0x540;
 
 /// The host car's physics snapshot at the grid, captured verbatim
-/// (`CarStateBroadcast` for `HOST_ENTITY`, sitting still in slot 0).
-/// Streamed at 20 Hz during a race so clients see a parked host car.
+/// (`CarStateBroadcast` for `HOST_ENTITY`, sitting still). Streamed at 20 Hz
+/// during a race so clients see a parked host car; its pose is patched to the
+/// current map's slot 0 in `start_race`.
 const HOST_CAR_STATE_HEX: &str = concat!(
     "0c000000ffffffff010000004005000001000000",
     "0000000092fc7fbf0000000021aa273ca00f8e42bb3f3f3f00007843000000005c58b6be",
@@ -111,8 +113,17 @@ const HOST_CAR_STATE_HEX: &str = concat!(
     "90880045010000000000000001000000000011c58e43",
 );
 
+/// Size of the opaque car state inside `CarState`/`CarStateBroadcast`; it
+/// opens with the 28-byte pose, and `live_host_state` patches two fields by
+/// offset within it.
+const CAR_STATE_LEN: usize = 94;
+
 /// Cadence of `CarState` traffic in the capture.
 const CAR_STATE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A real host relayed ~100 Hz avatar updates from a garage visitor at
+/// ~20 Hz, reliably; going faster only grows the retransmit queues.
+const AVATAR_RELAY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Pause between the last finish and `RaceEnd`, so finishers see the final
 /// times before the results notepad replaces them. A real host waits for the
@@ -192,6 +203,9 @@ struct Client {
     /// and the client is in the lobby.
     garage: Option<Vec<u8>>,
     ready: bool,
+    /// Spawned into the current race. A client that joins mid-race sits in
+    /// the lobby and must not hold up the countdown or the race end.
+    racing: bool,
     /// Crossed the finish in the current race.
     finished: bool,
     /// Sequence for the next reliable packet sent to this client. A real host
@@ -207,6 +221,13 @@ struct Client {
     /// Sequences already processed from this client, so a retransmit is
     /// re-acked but not re-applied.
     processed: Vec<u32>,
+    /// Chunked payloads from this client still being reassembled, by chunk id.
+    inbound: HashMap<u32, Reassembly>,
+    /// Clients waiting for this one's `VisitGarageResponse`; the response
+    /// does not name the visitor, so the host has to remember who asked.
+    visitors: Vec<SocketAddr>,
+    /// Last avatar-state relay; a real host forwards ~100 Hz input at ~20 Hz.
+    last_avatar: Instant,
 }
 
 impl Client {
@@ -220,12 +241,16 @@ impl Client {
             last_seen: Instant::now(),
             garage: None,
             ready: false,
+            racing: false,
             finished: false,
             next_seq: 1,
             next_ordered: 0,
             next_chunk: 1,
             pending: Vec::new(),
             processed: Vec::new(),
+            inbound: HashMap::new(),
+            visitors: Vec::new(),
+            last_avatar: Instant::now(),
         }
     }
 
@@ -238,6 +263,13 @@ impl Client {
     fn entity(&self) -> u32 {
         0x1000 + self.id.client_id
     }
+}
+
+/// One chunked payload being collected from a client.
+struct Reassembly {
+    buf: Vec<u8>,
+    /// Bytes received so far; complete once it reaches `buf.len()`.
+    have: usize,
 }
 
 /// Decode a compile-time hex literal into bytes.
@@ -275,6 +307,11 @@ struct Server {
     last_finish_time: f64,
     /// When to send `RaceEnd`, once finishing is settled.
     race_end_at: Option<Instant>,
+    /// `CarStateBroadcast` payload for the phantom host car, posed at slot 0
+    /// of the current map; its clock and grid flag are patched per send.
+    host_state: Vec<u8>,
+    /// When `RaceGo` went out; the grid flag clears 3 s later like a real car.
+    race_go_at: Option<Instant>,
 }
 
 impl Server {
@@ -291,6 +328,8 @@ impl Server {
             first_finish: None,
             last_finish_time: 0.0,
             race_end_at: None,
+            host_state: Vec::new(),
+            race_go_at: None,
         }
     }
 
@@ -308,12 +347,22 @@ impl Server {
         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
         let start = encode_start_race(&self.map().name);
         let host_garage = decode_hex(HOST_GARAGE_HEX);
+        let host_pose = self.map().grid_pose(0);
         let mut spawns = vec![encode_spawn_car(
             PlayerId::HOST,
             HOST_ENTITY,
             &host_garage,
-            &self.map().grid_pose(0),
+            &host_pose,
         )];
+        // The captured state has the capture's grid position baked in; a
+        // client spawned there would be inside the phantom and explode.
+        let mut host_state = decode_hex(HOST_CAR_STATE_HEX);
+        let pose_at = host_state.len() - CAR_STATE_LEN;
+        for (i, f) in host_pose.iter().enumerate() {
+            host_state[pose_at + 4 * i..pose_at + 4 * i + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        self.host_state = host_state;
+        self.race_go_at = None;
         let mut participants: Vec<&Client> = self
             .clients
             .values()
@@ -338,6 +387,7 @@ impl Server {
             }
         }
         for c in self.clients.values_mut() {
+            c.racing = c.garage.is_some();
             c.ready = false;
             c.finished = false;
         }
@@ -349,6 +399,24 @@ impl Server {
             self.map().name,
             spawns.len()
         );
+    }
+
+    /// The phantom's state for this instant. A real car's state carries its
+    /// sender clock and a "held at grid" flag that clears 3 s after RaceGo;
+    /// a frozen copy left clients drawing the host as loose wheels.
+    fn live_host_state(&self) -> Vec<u8> {
+        const GRID_FLAG: usize = 84;
+        const CLOCK: usize = 90;
+        let mut payload = self.host_state.clone();
+        let state_at = payload.len() - CAR_STATE_LEN;
+        let held = self
+            .race_go_at
+            .is_none_or(|t| t.elapsed() < Duration::from_secs(3));
+        payload[state_at + GRID_FLAG..state_at + GRID_FLAG + 4]
+            .copy_from_slice(&(held as u32).to_le_bytes());
+        payload[state_at + CLOCK..state_at + CLOCK + 4]
+            .copy_from_slice(&self.started.elapsed().as_secs_f32().to_le_bytes());
+        payload
     }
 
     /// A client crossed the finish: tell the others as the host does, and
@@ -379,17 +447,19 @@ impl Server {
         let all_finished = self
             .clients
             .values()
-            .filter(|c| c.garage.is_some())
+            .filter(|c| c.racing)
             .all(|c| c.finished);
         if !all_finished {
             return;
         }
+        // A hair behind the last real finisher, so the results table lists
+        // the phantom last instead of tied with a human.
         let host_finish = encode_car_crossed_finish(
             PlayerId::HOST,
             &Finish {
                 entity: HOST_ENTITY,
                 generation: 1,
-                time: self.last_finish_time,
+                time: self.last_finish_time + 0.001,
             },
         );
         for addr in self.lobby_peers(None) {
@@ -409,6 +479,7 @@ impl Server {
             self.send_reliable(addr, host_garage.clone(), true);
         }
         for c in self.clients.values_mut() {
+            c.racing = false;
             c.ready = false;
             c.finished = false;
         }
@@ -563,12 +634,36 @@ impl Server {
                 if client.processed.len() > 256 {
                     client.processed.remove(0);
                 }
-                if p.chunk.is_some() {
-                    // Clients have not been seen sending chunked payloads; a
-                    // relay would need reassembly to be correct, so say so.
-                    return Some(format!("dropped chunked seq {} (unsupported)", p.seq));
-                }
-                self.handle_event(from, p.payload)
+                let payload = match p.chunk {
+                    None => p.payload,
+                    Some(chunk) => {
+                        // Pieces are acked individually and deduplicated by
+                        // seq above, so byte counting is enough to know when
+                        // the whole event is in.
+                        let total = chunk.total_size as usize;
+                        let at = chunk.offset as usize;
+                        if at + p.payload.len() > total {
+                            return Some(format!(
+                                "bad chunk {} from {from}: piece past end",
+                                chunk.id
+                            ));
+                        }
+                        let r = client
+                            .inbound
+                            .entry(chunk.id)
+                            .or_insert_with(|| Reassembly {
+                                buf: vec![0; total],
+                                have: 0,
+                            });
+                        r.buf[at..at + p.payload.len()].copy_from_slice(&p.payload);
+                        r.have += p.payload.len();
+                        if r.have < total {
+                            return None;
+                        }
+                        client.inbound.remove(&chunk.id).expect("present").buf
+                    }
+                };
+                self.handle_event(from, payload)
             }
         }
     }
@@ -589,6 +684,19 @@ impl Server {
                     Err(e) => return Some(format!("bad CarState from {from}: {e}")),
                 };
                 self.relay_unreliable(from, &broadcast);
+                None
+            }
+            Ok(Event::UpdateAvatarState) => {
+                let c = self.clients.get_mut(&from).filter(|c| c.garage.is_some())?;
+                if c.last_avatar.elapsed() < AVATAR_RELAY_INTERVAL {
+                    return None;
+                }
+                c.last_avatar = Instant::now();
+                let id = c.id;
+                self.broadcast_reliable(
+                    from,
+                    encode_with_sender(Event::UpdateAvatarStateBroadcast, id, &payload),
+                );
                 None
             }
             kind => {
@@ -695,15 +803,19 @@ impl Server {
                     // The grid "press any button" confirm reuses Ready. A real
                     // host confirms last and then sends its own ReadyBroadcast
                     // plus RaceGo (bccap5 host lines 7799-7800); the phantom
-                    // host confirms the moment the last client does.
-                    let all_confirmed = self
-                        .clients
-                        .values()
-                        .filter(|c| c.garage.is_some())
-                        .all(|c| c.ready);
+                    // host confirms the moment the last client does. A late
+                    // joiner's lobby Ready lands here too and just waits.
+                    let racer = self.clients.get(&from).is_some_and(|c| c.racing);
+                    let all_confirmed = self.clients.values().filter(|c| c.racing).all(|c| c.ready);
+                    if !racer {
+                        return Some(format!(
+                            "lobby ready={ready} during a race -> broadcast to {n} peer(s)"
+                        ));
+                    }
                     if changed && all_confirmed {
                         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
                         let go = encode_race_go();
+                        self.race_go_at = Some(Instant::now());
                         for addr in self.lobby_peers(None) {
                             self.send_reliable(addr, host_ready.clone(), true);
                             self.send_reliable(addr, go.clone(), false);
@@ -733,6 +845,61 @@ impl Server {
                 // leaver, which never acks; dropping it here is equivalent.
                 self.remove_client(from, "disconnected");
                 Some("disconnect -> player left".to_string())
+            }
+
+            Ok(Event::RequestVisitGarage) => {
+                let owner = match decode_visit_request(&payload) {
+                    Ok(id) => id,
+                    Err(e) => return Some(format!("bad RequestVisitGarage from {from}: {e}")),
+                };
+                let visitor = self.clients.get(&from)?.id;
+                if owner == PlayerId::HOST {
+                    let response =
+                        encode_visit_garage_response(PlayerId::HOST, &decode_hex(HOST_GARAGE_HEX));
+                    self.send_reliable(from, response, true);
+                } else {
+                    // Clients answer any request they receive, so only the
+                    // owner may see it; the reply comes back without a
+                    // visitor id, hence the note of who is waiting.
+                    let Some((&owner_addr, owner_client)) =
+                        self.clients.iter_mut().find(|(_, c)| c.id == owner)
+                    else {
+                        return Some(format!("visit request for unknown player {owner:?}"));
+                    };
+                    owner_client.visitors.push(from);
+                    self.send_reliable(owner_addr, payload, true);
+                }
+                let entered = encode_garage_visit_broadcast(visitor, owner);
+                let location = encode_location_in_garage(visitor, owner);
+                for addr in self.lobby_peers(Some(from)) {
+                    self.send_reliable(addr, entered.clone(), true);
+                    self.send_reliable(addr, location.clone(), true);
+                }
+                Some(format!("visiting garage of {owner:?}"))
+            }
+
+            Ok(Event::VisitGarageResponse) => {
+                let visitors = std::mem::take(&mut self.clients.get_mut(&from)?.visitors);
+                for addr in &visitors {
+                    self.send_reliable(*addr, payload.clone(), true);
+                }
+                Some(format!(
+                    "garage response forwarded to {} visitor(s)",
+                    visitors.len()
+                ))
+            }
+
+            // Client events whose broadcast twin is the same body tagged
+            // with the sender.
+            Ok(Event::UpdateLocation) | Ok(Event::StopGarageVisit) => {
+                let id = self.clients.get(&from).filter(|c| c.garage.is_some())?.id;
+                let twin = if kind == Ok(Event::UpdateLocation) {
+                    Event::UpdateLocationBroadcast
+                } else {
+                    Event::StopGarageVisitBroadcast
+                };
+                let n = self.broadcast_reliable(from, encode_with_sender(twin, id, &payload));
+                Some(format!("{:?} -> {twin:?} to {n} peer(s)", kind.ok()?))
             }
 
             // Everything else, including events this server does not model,
@@ -841,7 +1008,6 @@ impl Server {
         self.socket
             .set_read_timeout(Some(Duration::from_millis(10)))?;
 
-        let host_state = encode(&Frame::Unreliable(decode_hex(HOST_CAR_STATE_HEX)));
         let mut buf = [0u8; 65536];
         let mut next_tick = Instant::now() + TICK;
         let mut next_car_state = Instant::now();
@@ -863,8 +1029,9 @@ impl Server {
                 next_tick = now + TICK;
             }
             if self.racing && now >= next_car_state {
+                let frame = encode(&Frame::Unreliable(self.live_host_state()));
                 for addr in self.lobby_peers(None) {
-                    self.send(addr, &host_state);
+                    self.send(addr, &frame);
                 }
                 next_car_state = now + CAR_STATE_INTERVAL;
             }

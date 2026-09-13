@@ -10,6 +10,8 @@
 //!   and the Unreliable car-state stream.
 //! * `finish_host`: real host, forest_long trimmed to its finish gate; both
 //!   cars cross, the host presses on, everyone returns to the lobby.
+//! * `garage_visit_host`: real host with two clients; the first visits the
+//!   host's garage from the lobby, walks around, returns to the hub.
 //!
 //! These tests fail if the framing is wrong in any way a hand-written encoder
 //! could get wrong: field widths, field order, option tags, and the trailing
@@ -17,13 +19,14 @@
 
 use beatermp_codec::{
     clock_of, decode_car_crossed_finish, decode_crossed_finish, decode_player_left, decode_ready,
-    encode, encode_car_crossed_finish, encode_garage_commit, encode_player_left, encode_race_end,
-    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race, event_kind, parse,
-    CarState, ClientInfo, Event, Frame, Packet, PlayerId, Pose, ServerInfo, CHUNK_SIZE,
-    GREETING_ID,
+    decode_visit_request, encode, encode_car_crossed_finish, encode_garage_commit,
+    encode_garage_visit_broadcast, encode_location_in_garage, encode_player_left, encode_race_end,
+    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
+    encode_visit_garage_response, encode_with_sender, event_kind, parse, CarState, ClientInfo,
+    Event, Frame, Packet, PlayerId, Pose, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
-const FIXTURES: [&str; 7] = [
+const FIXTURES: [&str; 8] = [
     "host_fd87.txt",
     "client_fd87.txt",
     "lobby_race_host.txt",
@@ -31,6 +34,7 @@ const FIXTURES: [&str; 7] = [
     "second_join_host.txt",
     "leave_host.txt",
     "finish_host.txt",
+    "garage_visit_host.txt",
 ];
 
 /// `(sent_by_this_side, bytes)` for every datagram in a fixture.
@@ -624,6 +628,109 @@ fn ready_toggle_and_broadcast_match_capture() {
         broadcast.ordered_index,
         Some(0),
         "first ordered event from the host"
+    );
+}
+
+/// A garage visit is the one flow where a client's request is answered with
+/// a chunked payload. The host's answer must be rebuilt byte for byte from
+/// the garage it committed at join time, and the three broadcasts that tell
+/// the other client about the visit must match.
+#[test]
+fn garage_visit_matches_capture() {
+    let host = fixture("garage_visit_host.txt");
+    let sent: Vec<Packet> = host
+        .iter()
+        .filter(|(sent, _)| *sent)
+        .filter_map(|(_, raw)| reliable(raw))
+        .collect();
+    let received: Vec<Packet> = host
+        .iter()
+        .filter(|(sent, _)| !sent)
+        .filter_map(|(_, raw)| reliable(raw))
+        .collect();
+    let find = |packets: &[Packet], event: Event| -> Packet {
+        packets
+            .iter()
+            .find(|p| event_kind(&p.payload) == Ok(event))
+            .unwrap_or_else(|| panic!("no {event:?}"))
+            .clone()
+    };
+
+    let request = find(&received, Event::RequestVisitGarage);
+    assert_eq!(decode_visit_request(&request.payload), Ok(PlayerId::HOST));
+
+    // The host's garage arrived as a GarageStateCommit; turn it back into
+    // the GarageState shape the server keeps.
+    let commit = find(&sent, Event::GarageStateCommit);
+    let mut garage_state = (Event::GarageState as u32).to_le_bytes().to_vec();
+    garage_state.extend_from_slice(&commit.payload[12..]);
+    assert_eq!(
+        encode_garage_commit(PlayerId::HOST, &garage_state),
+        commit.payload
+    );
+
+    let first = find(&sent, Event::VisitGarageResponse);
+    let chunk = first.chunk.expect("response is chunked");
+    let mut response = vec![0u8; chunk.total_size as usize];
+    let mut pieces = 0;
+    for p in sent
+        .iter()
+        .filter(|p| p.chunk.map(|c| c.id) == Some(chunk.id))
+    {
+        let at = p.chunk.unwrap().offset as usize;
+        response[at..at + p.payload.len()].copy_from_slice(&p.payload);
+        pieces += 1;
+    }
+    assert_eq!(pieces, chunk.count);
+    assert_eq!(
+        encode_visit_garage_response(PlayerId::HOST, &garage_state),
+        response
+    );
+
+    let visitor = PlayerId {
+        client_id: 1,
+        player_index: 1,
+    };
+    assert_eq!(
+        find(&sent, Event::GarageVisitBroadcast).payload,
+        encode_garage_visit_broadcast(visitor, PlayerId::HOST)
+    );
+    assert_eq!(
+        find(&sent, Event::UpdateLocationBroadcast).payload,
+        encode_location_in_garage(visitor, PlayerId::HOST)
+    );
+
+    // Sender-tagged rewraps: avatar state (Unreliable in, reliable out),
+    // location and stop-visit.
+    let avatar = host
+        .iter()
+        .filter(|(sent, _)| !sent)
+        .find_map(|(_, raw)| match parse(raw) {
+            Ok(Frame::Unreliable(p)) if event_kind(&p) == Ok(Event::UpdateAvatarState) => Some(p),
+            _ => None,
+        })
+        .expect("client sent avatar state");
+    let relayed = find(&sent, Event::UpdateAvatarStateBroadcast).payload;
+    assert_eq!(
+        relayed[..12],
+        encode_with_sender(Event::UpdateAvatarStateBroadcast, visitor, &avatar)[..12]
+    );
+    assert_eq!(relayed.len(), avatar.len() + 8);
+    let location = find(&received, Event::UpdateLocation);
+    let stop = find(&received, Event::StopGarageVisit);
+    // The last location broadcast is the one echoing the client's own
+    // UpdateLocation; the earlier one was host-generated on entering.
+    let back = sent
+        .iter()
+        .rfind(|p| event_kind(&p.payload) == Ok(Event::UpdateLocationBroadcast))
+        .unwrap();
+    assert_eq!(
+        back.payload,
+        encode_with_sender(Event::UpdateLocationBroadcast, visitor, &location.payload)
+    );
+    assert_eq!(
+        find(&sent, Event::StopGarageVisitBroadcast).payload,
+        encode_with_sender(Event::StopGarageVisitBroadcast, visitor, &stop.payload)
     );
 }
 
