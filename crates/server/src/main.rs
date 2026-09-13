@@ -42,10 +42,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use beatermp_codec::{
     clock_of, decode_crossed_finish, decode_ready, decode_visit_request, encode,
     encode_car_crossed_finish, encode_clock, encode_garage_commit, encode_garage_visit_broadcast,
-    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
-    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
-    encode_with_sender, event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame,
-    Packet, PlayerId, PlayerInfo, Pose, ServerInfo, CHUNK_SIZE, GREETING_ID,
+    encode_lobby_change_map, encode_location_in_garage, encode_player_left, encode_race_end,
+    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
+    encode_visit_garage_response, encode_with_sender, event_kind, parse, CarState, Chunk,
+    ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, RaceSettings, ServerInfo,
+    CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -135,21 +136,39 @@ const RACE_END_DELAY: Duration = Duration::from_secs(5);
 /// hold the lobby forever.
 const FINISH_GRACE: Duration = Duration::from_secs(180);
 
-/// A raceable scene and where its cars start.
+/// Variant names in the game's `VariantName` enum order; the wire value is
+/// the 1-based position (Default=1 and Reverse=2 observed on a real host).
+const VARIANTS: [&str; 5] = [
+    "Default",
+    "Reverse",
+    "Alternative",
+    "TimeAttack",
+    "TimeAttackReverse",
+];
+
+/// A raceable scene variant and where its cars start.
 struct Map {
     name: String,
+    /// 1-based index into [`VARIANTS`].
+    variant: u32,
     spawns: Vec<Pose>,
 }
 
 impl Map {
-    /// Look `name` up in the baked table. Slots are handed out in the scene's
-    /// own spawn-point order, which is also what a real host appeared to do.
-    fn load(name: &str) -> Option<Map> {
+    /// Look `spec` (`name` or `name:variant`, variant case-insensitive) up in
+    /// the baked table. Slots are handed out in the scene's own spawn-point
+    /// order, which is also what a real host appeared to do.
+    fn load(spec: &str) -> Option<Map> {
+        let (name, variant_name) = spec.split_once(':').unwrap_or((spec, "Default"));
+        let variant = VARIANTS
+            .iter()
+            .position(|v| v.eq_ignore_ascii_case(variant_name))? as u32
+            + 1;
         let mut lines = MAPS_TABLE.lines();
         let count: usize = loop {
             let header = lines.next()?;
             let mut words = header.split(' ');
-            if words.next() == Some(name) {
+            if words.next() == Some(name) && words.next() == Some(VARIANTS[variant as usize - 1]) {
                 break words.next()?.parse().ok()?;
             }
         };
@@ -166,15 +185,29 @@ impl Map {
             .collect();
         Some(Map {
             name: name.to_string(),
+            variant,
             spawns,
         })
     }
 
-    fn names() -> impl Iterator<Item = &'static str> {
+    /// Every `name:variant` the table knows, as accepted by `--map`.
+    fn names() -> impl Iterator<Item = String> {
         MAPS_TABLE
             .lines()
             .filter(|l| l.starts_with(|c: char| c.is_ascii_alphabetic()))
-            .filter_map(|l| l.split(' ').next())
+            .filter_map(|l| {
+                let mut words = l.split(' ');
+                Some(format!(
+                    "{}:{}",
+                    words.next()?,
+                    words.next()?.to_ascii_lowercase()
+                ))
+            })
+    }
+
+    /// `name | Variant`, the way the game's chat line names a track.
+    fn label(&self) -> String {
+        format!("{} | {}", self.name, VARIANTS[self.variant as usize - 1])
     }
 
     /// Grid placement for `slot` (host is 0). A lobby larger than the grid
@@ -294,6 +327,8 @@ struct Server {
     /// Maps to race, in order; `map_index` is the one the lobby is on.
     maps: Vec<Map>,
     map_index: usize,
+    /// Laps, night and rain for every race.
+    settings: RaceSettings,
     clients: HashMap<SocketAddr, Client>,
     next_client_id: u32,
     /// Clock reported in this server's own pings.
@@ -315,12 +350,13 @@ struct Server {
 }
 
 impl Server {
-    fn new(socket: UdpSocket, name: String, maps: Vec<Map>) -> Self {
+    fn new(socket: UdpSocket, name: String, maps: Vec<Map>, settings: RaceSettings) -> Self {
         Server {
             socket,
             name,
             maps,
             map_index: 0,
+            settings,
             clients: HashMap::new(),
             next_client_id: 1,
             started: Instant::now(),
@@ -345,7 +381,7 @@ impl Server {
     /// the grid gate is satisfied separately by the host's grid confirm.
     fn start_race(&mut self) {
         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
-        let start = encode_start_race(&self.map().name);
+        let start = encode_start_race(&self.map().name, self.map().variant, &self.settings);
         let host_garage = decode_hex(HOST_GARAGE_HEX);
         let host_pose = self.map().grid_pose(0);
         let mut spawns = vec![encode_spawn_car(
@@ -396,7 +432,7 @@ impl Server {
         self.race_end_at = None;
         println!(
             "race started on {} with {} car(s)",
-            self.map().name,
+            self.map().label(),
             spawns.len()
         );
     }
@@ -486,10 +522,14 @@ impl Server {
         self.racing = false;
         self.first_finish = None;
         self.race_end_at = None;
-        // Rotate for the next race. Only StartRace carries the map, so lobby
-        // members keep seeing the old minimap until the race loads.
+        // Rotate for the next race and tell the lobby, so minimaps and the
+        // "Host changed track" chat line match what StartRace will load.
         self.map_index = (self.map_index + 1) % self.maps.len();
-        println!("race over: {why}; next map {}", self.map().name);
+        let change = encode_lobby_change_map(&self.map().name, self.map().variant);
+        for addr in self.lobby_peers(None) {
+            self.send_reliable(addr, change.clone(), true);
+        }
+        println!("race over: {why}; next map {}", self.map().label());
     }
 
     fn send(&self, addr: SocketAddr, bytes: &[u8]) {
@@ -576,7 +616,7 @@ impl Server {
             applicant: joiner.id,
             host: PlayerId::HOST,
             map: self.map().name.clone(),
-            variant: 1,
+            variant: self.map().variant,
             enabled_mods: Vec::new(),
         }
     }
@@ -1049,16 +1089,21 @@ impl Server {
     }
 }
 
-const USAGE: &str = "usage: beatermp [--port N] [--name NAME] [--map MAP]... [--list-maps]
+const USAGE: &str = "usage: beatermp [--port N] [--name NAME] [--map MAP[:VARIANT]]... [--laps N] [--night] [--rain] [--list-maps]
   --port N     UDP port (default 6237, the only one unpatched clients reach)
   --name NAME  host name shown in the lobby (default beatermp)
-  --map MAP    map to race; repeat to rotate through several (default forest_long)
-  --list-maps  print the maps this build knows and exit";
+  --map MAP    map to race, optionally with a variant such as forest_long:reverse;
+               repeat to rotate through several (default forest_long)
+  --laps N     laps per race (default 1)
+  --night      race at night
+  --rain       race in the rain
+  --list-maps  print the maps and variants this build knows and exit";
 
 fn main() {
     let mut port = DEFAULT_PORT;
     let mut name = "beatermp".to_string();
     let mut maps: Vec<Map> = Vec::new();
+    let mut settings = RaceSettings::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || {
@@ -1082,6 +1127,14 @@ fn main() {
                     std::process::exit(2);
                 }));
             }
+            "--laps" => {
+                settings.laps = value().parse().ok().filter(|n| *n > 0).unwrap_or_else(|| {
+                    eprintln!("laps must be a positive number\n{USAGE}");
+                    std::process::exit(2);
+                })
+            }
+            "--night" => settings.night = true,
+            "--rain" => settings.rain = true,
             "--list-maps" => {
                 for name in Map::names() {
                     println!("{name}");
@@ -1103,13 +1156,16 @@ fn main() {
         std::process::exit(1);
     });
 
-    let rotation: Vec<&str> = maps.iter().map(|m| m.name.as_str()).collect();
+    let rotation: Vec<String> = maps.iter().map(Map::label).collect();
     println!(
-        "beatermp listening on 0.0.0.0:{port} as {name:?}, maps {}",
-        rotation.join(", ")
+        "beatermp listening on 0.0.0.0:{port} as {name:?}, maps {}, {} lap(s){}{}",
+        rotation.join(", "),
+        settings.laps,
+        if settings.night { ", night" } else { "" },
+        if settings.rain { ", rain" } else { "" },
     );
 
-    let mut server = Server::new(socket, name, maps);
+    let mut server = Server::new(socket, name, maps, settings);
     if let Err(e) = server.run() {
         eprintln!("server error: {e}");
         std::process::exit(1);

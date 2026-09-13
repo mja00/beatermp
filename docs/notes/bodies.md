@@ -22,7 +22,10 @@
 > - New variants: `13 PlayerJoined = [13][PlayerId][ClientInfo body]`,
 >   `23 Disconnect = [23][u32 0]` (client -> host), `24 PlayerLeft = [24][PlayerId]`.
 > - Race variants (`lobby_race_*.txt`, `grid_confirm_host.txt`): event ids are
->   `u32`, so `1 StartRace = [1][map][u32 0 1 0 0 1]`, `10 SpawnCar =
+>   `u32`, so `1 StartRace = [1][map][u32 0][u32 laps][u32 night][u32
+>   rain][u32 variant]` (`race_settings_host.txt`: `autumn_02`, 3 laps, night
+>   and rain on, Reverse = `0 3 1 1 2`; the leading word stayed `0` with CPU
+>   opponents configured, so CPU count/class are host-local), `10 SpawnCar =
 >   [10][u32 0][PlayerId][u32 entity][u32 generation][GarageState body][f32; 7
 >   pose]` (472 bytes, chunked 450 + 22), `11 CarState = [11][94-byte
 >   state][u32 entity][u32 generation]` (unreliable), `12 CarStateBroadcast =
@@ -390,9 +393,11 @@ Observed directly in captures (both fixtures, kind0 Data payloads):
 | ClientInfo | 15 | PROVEN |
 | GarageState | 16 | PROVEN |
 | GarageStateCommit | 17 | PROVEN |
+| LobbyChangeMap | 18 | PROVEN (`race_settings_host.txt`: `[18][map][u32 variant]`, ordered; Default=1, Reverse=2 observed, so the `VariantName` enum is 1-based on the wire) |
 | CrossedFinish | 4 | PROVEN (`finish_host.txt`; binary says "2 elements": `Entity`, `f64`) |
 | CarCrossedFinish | 5 | PROVEN (`finish_host.txt`; "3 elements": `PlayerId`, `Entity`, `f64`) |
 | (RaceEnd) | 3 | body `u8 1`, host -> clients when the host leaves the finish overlay; real variant name not recovered |
+| (CPU SpawnCar) | 10 | a real host spawns CPU opponents as SpawnCars with the leading `u32 1` instead of `0` and `PlayerId (n, 0)`; it simulates them itself |
 | UpdateAvatarState / UpdateAvatarStateBroadcast | 29 / 30 | PROVEN (`garage_visit_host.txt`; 48-byte avatar pose, broadcast prepends `PlayerId`) |
 | UpdateLocation / UpdateLocationBroadcast | 31 / 32 | PROVEN (`u32` location tag; host emits `2` + owner `PlayerId` for "in a garage") |
 | RequestVisitGarage | 33 | PROVEN (body: owner `PlayerId`) |

@@ -117,6 +117,9 @@ pub enum Event {
     GarageState = 16,
     /// Host -> client: the host's committed garage state.
     GarageStateCommit = 17,
+    /// Host -> lobby: the next race's map, `string map | u32 variant`. The
+    /// client prints "Host changed track to ..." and redraws the minimap.
+    LobbyChangeMap = 18,
     /// Unreliable, 1 Hz both ways: `f32` sender clock.
     Ping = 21,
     /// Unreliable: `f32` echo of the peer's most recent Ping clock.
@@ -174,6 +177,7 @@ impl Event {
             15 => Event::ClientInfo,
             16 => Event::GarageState,
             17 => Event::GarageStateCommit,
+            18 => Event::LobbyChangeMap,
             21 => Event::Ping,
             22 => Event::Pong,
             23 => Event::Disconnect,
@@ -627,7 +631,8 @@ pub struct ServerInfo {
     pub applicant: PlayerId,
     pub host: PlayerId,
     pub map: String,
-    /// Map variant selector (`VariantName`); `1` in every capture.
+    /// Map variant, 1-based in `Default, Reverse, Alternative, TimeAttack,
+    /// TimeAttackReverse` order (`1` and `2` observed).
     pub variant: u32,
     pub enabled_mods: Vec<String>,
 }
@@ -823,18 +828,52 @@ pub fn encode_with_sender(broadcast: Event, id: PlayerId, payload: &[u8]) -> Vec
     out
 }
 
-/// Encode an [`Event::StartRace`] for `map`.
+/// Host-chosen race options carried in [`Event::StartRace`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaceSettings {
+    pub laps: u32,
+    pub night: bool,
+    pub rain: bool,
+}
+
+impl Default for RaceSettings {
+    fn default() -> Self {
+        RaceSettings {
+            laps: 1,
+            night: false,
+            rain: false,
+        }
+    }
+}
+
+/// Encode an [`Event::StartRace`] for `map` and its 1-based `variant`.
 ///
-/// The five words after the map name were `0 1 0 0 1` in the only captured
-/// start (`forest_long`, default variant); `RaceSettings` field names were not
-/// recovered, so they are replayed verbatim.
-pub fn encode_start_race(map: &str) -> Vec<u8> {
+/// Body after the map name: `u32 0 | laps | night | rain | variant`. The
+/// leading word stayed `0` across captures with different CPU opponent
+/// settings, so CPU count and class are not sent here.
+pub fn encode_start_race(map: &str, variant: u32, settings: &RaceSettings) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + map.len());
     out.extend_from_slice(&(Event::StartRace as u32).to_le_bytes());
     put_string(&mut out, map);
-    for word in [0u32, 1, 0, 0, 1] {
+    let words = [
+        0u32,
+        settings.laps,
+        settings.night as u32,
+        settings.rain as u32,
+        variant,
+    ];
+    for word in words {
         out.extend_from_slice(&word.to_le_bytes());
     }
+    out
+}
+
+/// Encode an [`Event::LobbyChangeMap`] announcing `map` / `variant`.
+pub fn encode_lobby_change_map(map: &str, variant: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + map.len());
+    out.extend_from_slice(&(Event::LobbyChangeMap as u32).to_le_bytes());
+    put_string(&mut out, map);
+    out.extend_from_slice(&variant.to_le_bytes());
     out
 }
 

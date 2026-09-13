@@ -62,7 +62,7 @@ someone must press Start Race on it. Automating that is more `xdotool`.
 
 ```sh
 cargo build --release
-./target/release/beatermp [--port 6237] [--name beatermp] [--map forest_long]...
+./target/release/beatermp [--port 6237] [--name beatermp] [--map forest_long[:reverse]]... [--laps 1] [--night] [--rain]
 ./target/release/beatermp --list-maps
 ```
 
@@ -85,17 +85,22 @@ mid-race waits in the lobby until the next race. Garage visits work too:
 player it fetches that player's garage through the server, and the visitor's
 avatar, location and return to the hub are relayed to the others.
 
-Maps: `--map` picks any scene the game can race (repeat it for a rotation that
+Maps: `--map` picks any scene and variant the game can race (`name` or
+`name:variant`, variants being default, reverse, alternative, timeattack and
+timeattackreverse where the scene has them; repeat it for a rotation that
 advances after each race). Grid poses come from `crates/server/maps.txt`, which
-`tools/re/spawns.py` extracts from the game's `scene.ron` files, so the server
-needs no game install. Only StartRace carries the map name, so after a rotation
-the lobby keeps showing the previous minimap until the next race loads.
+`tools/re/spawns.py` extracts per variant from the game's `scene.ron` files, so
+the server needs no game install. After each race the server announces the next
+track with LobbyChangeMap, exactly as a real host's Change Map does, so the
+lobby minimap follows the rotation. `--laps`, `--night` and `--rain` set the
+race settings a real host picks in its Race Settings panel.
 
 Limits: the host car is a parked phantom on grid slot 0 (a client only accepts
 a race with a host car present); its car state is a captured constant with
 the pose, grid flag and clock patched live, and it "finishes" 1 ms behind the
-last real finisher so the results table has no empty row. Race settings and
-variant are the captured defaults (one lap).
+last real finisher so the results table has no empty row. CPU opponents are
+not supported: a real host spawns them as extra SpawnCars (leading `u32 1`)
+and simulates them itself, which needs the game's physics.
 
 ## Protocol
 
@@ -124,7 +129,7 @@ count from `(1, 1)`.
 
 | id | event | direction | body |
 |---|---|---|---|
-| 1 | StartRace | host -> all | map name, `u32 0 1 0 0 1` race settings (ordered) |
+| 1 | StartRace | host -> all | map name, `u32 0`, `u32 laps`, `u32 night`, `u32 rain`, `u32 variant` (ordered) |
 | 2 | RaceGo | host -> all | empty; the host's own grid confirm, starts the countdown |
 | 3 | RaceEnd | host -> all | `u8 1`; everyone to the results notepad, then the lobby (ordered). Name inferred, not recovered |
 | 4 | CrossedFinish | client -> host | `u32 entity`, `u32 generation`, `f64 race time` |
@@ -139,6 +144,7 @@ count from `(1, 1)`.
 | 15 | ClientInfo | client -> host | name, `u64 0` |
 | 16 | GarageState | client -> host | 420-byte car description |
 | 17 | GarageStateCommit | host -> client | `PlayerId owner`, GarageState body |
+| 18 | LobbyChangeMap | host -> lobby | map name, `u32 variant` (1 Default, 2 Reverse, 3 Alternative, 4 TimeAttack, 5 TimeAttackReverse); ordered |
 | 21 | Ping | both | `f32` clock, unreliable, 1 Hz |
 | 22 | Pong | both | `f32` echo |
 | 23 | Disconnect | client -> host | `u32 0` |
@@ -206,6 +212,6 @@ sender's `PlayerId`.
   listing of a capture.
 - `tools/re/extract_fields.py <binary>`: recovers serde field-name tables.
 - `tools/re/spawns.py [game_dir] > crates/server/maps.txt`: regenerates the
-  baked grid-pose table.
+  baked per-variant grid-pose table.
 
 Development: `cargo test -p beatermp-codec`, `cargo clippy --release --all-targets`.

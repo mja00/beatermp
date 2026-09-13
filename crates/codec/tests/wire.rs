@@ -20,13 +20,14 @@
 use beatermp_codec::{
     clock_of, decode_car_crossed_finish, decode_crossed_finish, decode_player_left, decode_ready,
     decode_visit_request, encode, encode_car_crossed_finish, encode_garage_commit,
-    encode_garage_visit_broadcast, encode_location_in_garage, encode_player_left, encode_race_end,
-    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
-    encode_visit_garage_response, encode_with_sender, event_kind, parse, CarState, ClientInfo,
-    Event, Frame, Packet, PlayerId, Pose, ServerInfo, CHUNK_SIZE, GREETING_ID,
+    encode_garage_visit_broadcast, encode_lobby_change_map, encode_location_in_garage,
+    encode_player_left, encode_race_end, encode_race_go, encode_ready_broadcast, encode_spawn_car,
+    encode_start_race, encode_visit_garage_response, encode_with_sender, event_kind, parse,
+    CarState, ClientInfo, Event, Frame, Packet, PlayerId, Pose, RaceSettings, ServerInfo,
+    CHUNK_SIZE, GREETING_ID,
 };
 
-const FIXTURES: [&str; 8] = [
+const FIXTURES: [&str; 9] = [
     "host_fd87.txt",
     "client_fd87.txt",
     "lobby_race_host.txt",
@@ -35,6 +36,7 @@ const FIXTURES: [&str; 8] = [
     "leave_host.txt",
     "finish_host.txt",
     "garage_visit_host.txt",
+    "race_settings_host.txt",
 ];
 
 /// `(sent_by_this_side, bytes)` for every datagram in a fixture.
@@ -218,7 +220,10 @@ fn start_race_and_spawn_cars_match_capture() {
             .filter(move |p| event_kind(&p.payload) == Ok(e))
     };
     let start = payloads(true, Event::StartRace).next().expect("StartRace");
-    assert_eq!(start.payload, encode_start_race("forest_long"));
+    assert_eq!(
+        start.payload,
+        encode_start_race("forest_long", 1, &RaceSettings::default())
+    );
     assert_eq!(
         start.ordered_index,
         Some(1),
@@ -629,6 +634,41 @@ fn ready_toggle_and_broadcast_match_capture() {
         Some(0),
         "first ordered event from the host"
     );
+}
+
+/// A host that picked `autumn_02 | Reverse` with 3 laps, night and rain
+/// announced the track twice in the lobby and then started the race; each
+/// of those payloads must be reproducible from the chosen settings.
+#[test]
+fn map_changes_and_race_settings_match_capture() {
+    let host = fixture("race_settings_host.txt");
+    let mut sent = host
+        .iter()
+        .filter(|(s, _)| *s)
+        .filter_map(|(_, raw)| reliable(raw))
+        .filter(|p| {
+            matches!(
+                event_kind(&p.payload),
+                Ok(Event::LobbyChangeMap | Event::StartRace)
+            )
+        });
+    let first = sent.next().expect("first LobbyChangeMap");
+    assert_eq!(first.payload, encode_lobby_change_map("autumn_01", 1));
+    assert_eq!(first.ordered_index, Some(0), "map changes are ordered");
+    let second = sent.next().expect("second LobbyChangeMap");
+    assert_eq!(second.payload, encode_lobby_change_map("autumn_02", 2));
+    let start = sent.next().expect("StartRace");
+    let settings = RaceSettings {
+        laps: 3,
+        night: true,
+        rain: true,
+    };
+    assert_eq!(
+        start.payload,
+        encode_start_race("autumn_02", 2, &settings),
+        "variant travels in the last word, after laps/night/rain"
+    );
+    assert!(sent.next().is_none());
 }
 
 /// A garage visit is the one flow where a client's request is answered with
