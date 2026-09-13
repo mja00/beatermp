@@ -1,0 +1,242 @@
+(
+    garages: {
+        5: (
+            cars: [
+                (
+                    wheels: (Some(Some((
+                        base: Small,
+                        state: (
+                            condition: 0.8892997,
+                            tire_type: Street,
+                            rim: "rim_default",
+                        ),
+                    ))), Some(Some((
+                        base: Small,
+                        state: (
+                            condition: 0.8003973,
+                            tire_type: Street,
+                            rim: "rim_default",
+                        ),
+                    ))), Some(Some((
+                        base: Small,
+                        state: (
+                            condition: 0.7952792,
+                            tire_type: Street,
+                            rim: "rim_default",
+                        ),
+                    ))), Some(Some((
+                        base: Small,
+                        state: (
+                            condition: 0.7936101,
+                            tire_type: Street,
+                            rim: "rim_default",
+                        ),
+                    )))),
+                    base_file: "Zap",
+                    engine_condition: 0.6152692443031484,
+                    brakes_condition: (0.5743939921378453, 0.5726452806213831, 0.5405775839693602, 0.548849788371935),
+                    suspension_condition: (0.721594340710476, 0.7280441072386499, 0.7406212527222669, 0.7386023262685678),
+                    suspension_stiffness_modifiers: (Stock, Stock, Stock, Stock),
+                    clutch_condition: 0.7190537154486668,
+                    airfilter_condition: 0.838871102147403,
+                    oil_condition: 0.8615472205821237,
+                    gearbox_bearings_condition: 0.9079486108659881,
+                    gears_conditions: [
+                        0.9997982961153205,
+                        0.9935041035822001,
+                        0.9478552741828153,
+                        0.9079782814791988,
+                        0.9667612663724724,
+                    ],
+                    spare: None,
+                    trunk_items: [],
+                    color: Custom((0.87, 0.62, 0.25)),
+                    flywheel: Stock,
+                    differential: Open,
+                    brake_line_busted: false,
+                    handbrake_snapped: false,
+                    wheel_bearing_conditions: (0.9172145, 0.91078645, 0.76067793, 0.7495748),
+                    cylinders: [
+                        (
+                            sparkplug: true,
+                            sparkplug_age: 423.75654804795397,
+                        ),
+                        (
+                            sparkplug: true,
+                            sparkplug_age: 423.75654804795397,
+                        ),
+                        (
+                            sparkplug: true,
+                            sparkplug_age: 423.75654804795397,
+                        ),
+                        (
+                            sparkplug: true,
+                            sparkplug_age: 423.75654804795397,
+                        ),
+                    ],
+                    class_override: None,
+                    dirtyness: 0.16395289,
+                    load_failed_from: None,
+                    livery: [],
+                ),
+            ],
+        ),
+    },
+    players_held_item: None,
+    delivery_items: [
+        Cup(Gold, "Beater\'s Cross"),
+    ],
+    garbage_items: [
+        Wheel((
+            base: Custom(
+                width: 0.3,
+                rim_diameter: 0.3302,
+                aspect: 0.6,
+            ),
+            state: (
+                condition: 0.12605606,
+                tire_type: Street,
+                rim: "rim_default",
+            ),
+        )),
+        Wheel((
+            base: Custom(
+                width: 0.2,
+                rim_diameter: 0.3302,
+                aspect: 0.65,
+            ),
+            state: (
+                condition: 0.29628086,
+                tire_type: Street,
+                rim: "rim_default",
+            ),
+        )),
+        Wheel((
+            base: Custom(
+                width: 0.18,
+                rim_diameter: 0.4064,
+                aspect: 0.6,
+            ),
+            state: (
+                condition: 0.103232935,
+                tire_type: Street,
+                rim: "rim_default",
+            ),
+        )),
+    ],
+    garage_items: [
+        (((-1.5853336, 0.0, 0.5252554), (0.0, -0.80802906, -0.0, 0.5891427)), Airfilter((
+            condition: 0.38,
+        ))),
+        (((-1.6742033, 0.11, 0.8283131), (0.0, -0.8397801, -0.0, 0.54292667)), WheelBearing(0.0)),
+    ],
+    furniture: [
+        ((-8.9, 1.85, -2.4), (0.0, 0.0, 0.0, 1.0), TireWallMount(Some((
+            base: Small,
+            state: (
+                condition: 1.0,
+                tire_type: Street,
+                rim: "rim_default",
+            ),
+        )))),
+    ],
+    entities: [],
+    purchased_cars_today: [],
+    purchased_items_today: [],
+    selected_car: (5, 0),
+    time: 3,
+    money: 6750,
+    stage: None,
+    progress: None,
+    event_place: {
+        "Local Racing Event": 0,
+        "Tutorial Race": 0,
+        "Beater\'s Cross": 0,
+    },
+    unlocked_rewards: [],
+    leaderboards: {
+        (
+            event: "Tutorial Race",
+            day: 0,
+        ): {
+            Player: (
+                score: 1,
+                time: 72.69971843199993,
+            ),
+        },
+        (
+            event: "Local Racing Event",
+            day: 0,
+        ): {
+            Opponent("Maxim Ivanov"): (
+                score: 7,
+                time: 521.8289699570413,
+            ),
+            Opponent("Vladimir Stepanov"): (
+                score: 10,
+                time: 522.7928159103649,
+            ),
+            Player: (
+                score: 15,
+                time: 471.8806775519996,
+            ),
+            Opponent("Boris Sachkov"): (
+                score: 14,
+                time: 494.7369520770312,
+            ),
+            Opponent("Dmitry Rudenko"): (
+                score: 7,
+                time: 511.65752576449086,
+            ),
+            Opponent("Iskander Palcev"): (
+                score: 10,
+                time: 518.8986905186792,
+            ),
+        },
+        (
+            event: "Beater\'s Cross",
+            day: 0,
+        ): {
+            Player: (
+                score: 18,
+                time: 642.4613530920003,
+            ),
+            Opponent("Kamilla Serova"): (
+                score: 8,
+                time: 747.0859083297318,
+            ),
+            Opponent("Alexey Vasiliev"): (
+                score: 5,
+                time: 756.5554060103958,
+            ),
+            Opponent("Anton Vladimirovich"): (
+                score: 7,
+                time: 734.4711317184036,
+            ),
+            Opponent("Gregory Gorbynov"): (
+                score: 14,
+                time: 707.6383346679276,
+            ),
+            Opponent("Julia Novikova"): (
+                score: 11,
+                time: 797.6571554305618,
+            ),
+        },
+    },
+    tutorial_state: Complete,
+    post_tutorial_tips: (
+        car_reset: true,
+    ),
+    npc_relationships: (
+        viktor_relationship: Neutral,
+    ),
+    quest_states: (
+        viktor_quest: NotTaken,
+        viktor_delivery: NotTaken,
+        racer_deal: (NotTaken, ""),
+    ),
+    sponsor_state: None,
+    npc_encounter: None,
+    story_point: Freeroam,
+    game_completed: false,
+)

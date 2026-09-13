@@ -1,0 +1,8 @@
+mark1 client=4180 host=4433
+mark2(after client ready) client=4311 host=4559
+mark3(before host ready) client=5778 host=6097
+mark4(after host ready) client=5910 host=6222
+mark5(before start race) client=6843 host=7120
+mark6(25s after start race) client=8017 host=8274
+mark7(before confirm) client=8782 host=9043
+mark8(after race driving) client=9946 host=10203

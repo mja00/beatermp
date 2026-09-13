@@ -1,0 +1,14 @@
+[package]
+name = "beatermp-server"
+description = "Headless multiplayer server for BeaterCore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "beatermp"
+path = "src/main.rs"
+
+[dependencies]
+beatermp-codec.workspace = true

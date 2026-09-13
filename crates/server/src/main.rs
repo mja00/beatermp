@@ -1,0 +1,950 @@
+//! A headless multiplayer server for BeaterCore.
+//!
+//! # Why this exists
+//!
+//! BeaterCore ships no dedicated server binary: the only way to host is to run
+//! the full game, which needs an X display (winit panics without one), a GPU,
+//! and about 1.3 cores plus 600 MB of RAM to sit on a menu. This binary speaks
+//! the same UDP protocol without any of that.
+//!
+//! # What it implements
+//!
+//! The join handshake, the reliability layer (acks and retransmits), the lobby
+//! Ready toggle, and relaying of everything else between joined clients. The
+//! observed exchange it reproduces (see `beatermp-codec` for the wire format):
+//!
+//! ```text
+//! client  -> Greeting                       server -> Greeting (echo)
+//! client  -> Reliable ClientInfo            server -> Ack, Reliable ServerInfo, Reliable GarageStateCommit
+//! client  -> Ack, Ack, Reliable GarageState server -> Ack
+//! both    -> Unreliable Ping at 1 Hz, answered with a Pong echoing the clock
+//! client  -> Reliable Ready(bool)           server -> Ack, ReadyBroadcast to the other clients
+//! all ready                                 server -> ReadyBroadcast(host), StartRace, SpawnCar per car
+//! client  -> Reliable Ready(true) at grid   server -> ReadyBroadcast to the others; once everyone
+//!                                                     confirmed: ReadyBroadcast(host), RaceGo
+//! client  -> Unreliable CarState at 20 Hz   server -> CarStateBroadcast to the other clients
+//! client  -> Reliable CrossedFinish          server -> CarCrossedFinish to the other clients; once
+//!                                                     everyone finished: CarCrossedFinish(host),
+//!                                                     then RaceEnd and GarageStateCommit(host)
+//! client  -> Reliable GarageState (worn)     server -> GarageStateCommit to the other clients
+//! ```
+//!
+//! It does not simulate anything: the host car is a parked phantom that
+//! "finishes" with the last real finisher's time so the results table is
+//! complete, and a race also ends when a grace period after the first finish
+//! runs out or the lobby empties.
+
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use beatermp_codec::{
+    clock_of, decode_crossed_finish, decode_ready, encode, encode_car_crossed_finish, encode_clock,
+    encode_garage_commit, encode_player_left, encode_race_end, encode_race_go,
+    encode_ready_broadcast, encode_spawn_car, encode_start_race, event_kind, parse, CarState,
+    Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, ServerInfo,
+    CHUNK_SIZE, GREETING_ID,
+};
+
+/// The port the game hardcodes. It is a string literal in the binary, so a
+/// client can only reach a server on this port unless the binary is patched.
+const DEFAULT_PORT: u16 = 6237;
+
+/// Ping cadence and retransmit interval measured from captures: 1 Hz.
+const TICK: Duration = Duration::from_millis(1000);
+
+/// Drop a client after this long without a datagram. Generous relative to the
+/// 1 Hz ping so a brief stall does not evict anyone.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Give up on a reliable packet after this many sends; the peer is gone.
+const MAX_RESENDS: u8 = 15;
+
+/// The map every captured lobby advertised; used when none is given.
+const DEFAULT_MAP: &str = "forest_long";
+
+/// Grid poses per raceable scene, extracted from the game's `scene.ron`
+/// files by `tools/re/spawns.py` so the server needs no game install.
+const MAPS_TABLE: &str = include_str!("../maps.txt");
+
+/// A car at rest sits this far above its spawn point's y on flat ground
+/// (captured host: 0.754 over a spawn at 0.0). Spawning there instead of in
+/// the terrain avoids a physics pop at the grid.
+const SPAWN_LIFT: f32 = 0.75;
+
+/// `AvatarState` as every real host and client has sent it; opaque here.
+const AVATAR: [u8; 5] = [0; 5];
+
+/// A stock car's `GarageState` payload, captured verbatim.
+///
+/// A joining client expects a garage commit for the host during the handshake;
+/// committing this stock body keeps the handshake complete without modelling
+/// vehicle state. Encoded as hex because it is opaque to this server.
+const HOST_GARAGE_HEX: &str = concat!(
+    "10000000",
+    "01010000000025a9633f000000000b0000000000000072696d5f64656661756c74",
+    "010100000000d6e64c3f000000000b0000000000000072696d5f64656661756c74",
+    "0101000000006b974b3f000000000b0000000000000072696d5f64656661756c74",
+    "010100000000082a4b3f000000000b0000000000000072696d5f64656661756c74",
+    "03000000000000005a61707488502049b0e33f970768826f61e23f5c480f321c53",
+    "e23fcb2b835c694ce13fdc2a6f6e2d90e13fcd90ca034d17e73f2a56d427234ce7",
+    "3f1e4565572bb3e73f2f568258a1a2e73f01000000010000000100000001000000",
+    "056bfdef7c02e73fd30aa93508d8ea3f76840b7acb91eb3f0fc7c33eea0ded3f05",
+    "00000000000000ac2d0dff58feef3f9e792a1ec9caef3f0d9a7e95d454ee3f5ece",
+    "0d78280eed3f7f7fc352b5efee3f0000000000000000000300000052b85e3f52b8",
+    "1e3f0000803e0100000001000000000092ce6a3f4d29693fcabb423f22e43f3f04",
+    "00000000000000010a3d20d21a7c7a40010a3d20d21a7c7a40010a3d20d21a7c7a",
+    "40010a3d20d21a7c7a400044e3273e000000000000000000",
+);
+
+/// Entity the real host gave its own car; clients only echo it.
+const HOST_ENTITY: u32 = 0x540;
+
+/// The host car's physics snapshot at the grid, captured verbatim
+/// (`CarStateBroadcast` for `HOST_ENTITY`, sitting still in slot 0).
+/// Streamed at 20 Hz during a race so clients see a parked host car.
+const HOST_CAR_STATE_HEX: &str = concat!(
+    "0c000000ffffffff010000004005000001000000",
+    "0000000092fc7fbf0000000021aa273ca00f8e42bb3f3f3f00007843000000005c58b6be",
+    "000000000000000000000000000000000000000017798e3e0000803f0000000000000000",
+    "90880045010000000000000001000000000011c58e43",
+);
+
+/// Cadence of `CarState` traffic in the capture.
+const CAR_STATE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Pause between the last finish and `RaceEnd`, so finishers see the final
+/// times before the results notepad replaces them. A real host waits for the
+/// host player to press a button here.
+const RACE_END_DELAY: Duration = Duration::from_secs(5);
+
+/// End the race this long after the first finish even if someone is still
+/// out on the track (stuck, crashed, or idling); otherwise one player could
+/// hold the lobby forever.
+const FINISH_GRACE: Duration = Duration::from_secs(180);
+
+/// A raceable scene and where its cars start.
+struct Map {
+    name: String,
+    spawns: Vec<Pose>,
+}
+
+impl Map {
+    /// Look `name` up in the baked table. Slots are handed out in the scene's
+    /// own spawn-point order, which is also what a real host appeared to do.
+    fn load(name: &str) -> Option<Map> {
+        let mut lines = MAPS_TABLE.lines();
+        let count: usize = loop {
+            let header = lines.next()?;
+            let mut words = header.split(' ');
+            if words.next() == Some(name) {
+                break words.next()?.parse().ok()?;
+            }
+        };
+        let spawns = lines
+            .take(count)
+            .map(|line| {
+                let mut pose: Pose = [0.0; 7];
+                for (slot, word) in pose.iter_mut().zip(line.split(' ')) {
+                    *slot = word.parse().expect("maps.txt is generated");
+                }
+                pose[5] += SPAWN_LIFT;
+                pose
+            })
+            .collect();
+        Some(Map {
+            name: name.to_string(),
+            spawns,
+        })
+    }
+
+    fn names() -> impl Iterator<Item = &'static str> {
+        MAPS_TABLE
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_alphabetic()))
+            .filter_map(|l| l.split(' ').next())
+    }
+
+    /// Grid placement for `slot` (host is 0). A lobby larger than the grid
+    /// wraps onto the first points; the game itself caps lobbies per map.
+    fn grid_pose(&self, slot: usize) -> Pose {
+        self.spawns[slot % self.spawns.len()]
+    }
+}
+
+/// A reliable packet waiting for its ack.
+struct Pending {
+    packet: Packet,
+    last_sent: Instant,
+}
+
+/// What this server knows about a connected client.
+struct Client {
+    /// Identity as the client announced it; `None` until its `ClientInfo`.
+    info: Option<ClientInfo>,
+    /// Assigned slot. `u32::MAX` is the host in the game's own captures, so
+    /// assigned client ids start at 1; this server never splits screens.
+    id: PlayerId,
+    last_seen: Instant,
+    /// The client's `GarageState` payload, kept so it can be committed to
+    /// every other lobby member. `Some` once the join handshake is complete
+    /// and the client is in the lobby.
+    garage: Option<Vec<u8>>,
+    ready: bool,
+    /// Crossed the finish in the current race.
+    finished: bool,
+    /// Sequence for the next reliable packet sent to this client. A real host
+    /// numbers them from 1 per session, and a client that sees an unexpected
+    /// number drops the packet, so this is per client.
+    next_seq: u32,
+    /// Position in the ordered stream of lobby events sent to this client.
+    next_ordered: u32,
+    /// Id for the next chunked message to this client.
+    next_chunk: u32,
+    /// Reliable packets sent but not yet acked.
+    pending: Vec<Pending>,
+    /// Sequences already processed from this client, so a retransmit is
+    /// re-acked but not re-applied.
+    processed: Vec<u32>,
+}
+
+impl Client {
+    fn new(client_id: u32) -> Self {
+        Client {
+            info: None,
+            id: PlayerId {
+                client_id,
+                player_index: 1,
+            },
+            last_seen: Instant::now(),
+            garage: None,
+            ready: false,
+            finished: false,
+            next_seq: 1,
+            next_ordered: 0,
+            next_chunk: 1,
+            pending: Vec::new(),
+            processed: Vec::new(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.info.as_ref().map_or("", |i| i.name.as_str())
+    }
+
+    /// Entity index for this client's car. Any value distinct from the host's
+    /// works: it is a label clients echo back in `CarState`.
+    fn entity(&self) -> u32 {
+        0x1000 + self.id.client_id
+    }
+}
+
+/// Decode a compile-time hex literal into bytes.
+fn decode_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex literal"))
+        .collect()
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+struct Server {
+    socket: UdpSocket,
+    /// Name shown over the host's car in the lobby.
+    name: String,
+    /// Maps to race, in order; `map_index` is the one the lobby is on.
+    maps: Vec<Map>,
+    map_index: usize,
+    clients: HashMap<SocketAddr, Client>,
+    next_client_id: u32,
+    /// Clock reported in this server's own pings.
+    started: Instant,
+    /// Set by `start_race`; cleared by `end_race` once everyone finished (or
+    /// the grace ran out) and when the lobby empties.
+    racing: bool,
+    /// When the first car finished; starts the grace clock.
+    first_finish: Option<Instant>,
+    /// Race time of the latest finisher; the phantom host "finishes" with it.
+    last_finish_time: f64,
+    /// When to send `RaceEnd`, once finishing is settled.
+    race_end_at: Option<Instant>,
+}
+
+impl Server {
+    fn new(socket: UdpSocket, name: String, maps: Vec<Map>) -> Self {
+        Server {
+            socket,
+            name,
+            maps,
+            map_index: 0,
+            clients: HashMap::new(),
+            next_client_id: 1,
+            started: Instant::now(),
+            racing: false,
+            first_finish: None,
+            last_finish_time: 0.0,
+            race_end_at: None,
+        }
+    }
+
+    fn map(&self) -> &Map {
+        &self.maps[self.map_index]
+    }
+
+    /// Do what a real host does on Start Race: mark the host ready, announce
+    /// the race, then spawn one car per participant (host first) into every
+    /// client's world, all on the ordered stream.
+    ///
+    /// The host's ReadyBroadcast mirrors the capture (lobby_race_host.txt:860);
+    /// the grid gate is satisfied separately by the host's grid confirm.
+    fn start_race(&mut self) {
+        let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
+        let start = encode_start_race(&self.map().name);
+        let host_garage = decode_hex(HOST_GARAGE_HEX);
+        let mut spawns = vec![encode_spawn_car(
+            PlayerId::HOST,
+            HOST_ENTITY,
+            &host_garage,
+            &self.map().grid_pose(0),
+        )];
+        let mut participants: Vec<&Client> = self
+            .clients
+            .values()
+            .filter(|c| c.garage.is_some())
+            .collect();
+        participants.sort_by_key(|c| c.id.client_id);
+        for (slot, c) in participants.iter().enumerate() {
+            let garage = c.garage.as_ref().expect("filtered");
+            spawns.push(encode_spawn_car(
+                c.id,
+                c.entity(),
+                garage,
+                &self.map().grid_pose(slot + 1),
+            ));
+        }
+        let targets = self.lobby_peers(None);
+        for addr in targets {
+            self.send_reliable(addr, host_ready.clone(), true);
+            self.send_reliable(addr, start.clone(), true);
+            for spawn in &spawns {
+                self.send_reliable(addr, spawn.clone(), true);
+            }
+        }
+        for c in self.clients.values_mut() {
+            c.ready = false;
+            c.finished = false;
+        }
+        self.racing = true;
+        self.first_finish = None;
+        self.race_end_at = None;
+        println!(
+            "race started on {} with {} car(s)",
+            self.map().name,
+            spawns.len()
+        );
+    }
+
+    /// A client crossed the finish: tell the others as the host does, and
+    /// schedule the end once nobody is left racing.
+    fn car_finished(&mut self, from: SocketAddr, finish: Finish) {
+        let Some(c) = self.clients.get_mut(&from) else {
+            return;
+        };
+        c.finished = true;
+        let id = c.id;
+        println!("{} finished in {:.3} s", c.name(), finish.time);
+        let relay = encode_car_crossed_finish(id, &finish);
+        for addr in self.lobby_peers(Some(from)) {
+            self.send_reliable(addr, relay.clone(), false);
+        }
+        self.first_finish.get_or_insert_with(Instant::now);
+        self.last_finish_time = finish.time;
+        self.settle_finish();
+    }
+
+    /// Once every remaining racer has finished, the phantom host "finishes"
+    /// too (so the results table shows no 0.000 row) and `RaceEnd` is
+    /// scheduled. Called after a finish and after a racer leaves.
+    fn settle_finish(&mut self) {
+        if !self.racing || self.race_end_at.is_some() {
+            return;
+        }
+        let all_finished = self
+            .clients
+            .values()
+            .filter(|c| c.garage.is_some())
+            .all(|c| c.finished);
+        if !all_finished {
+            return;
+        }
+        let host_finish = encode_car_crossed_finish(
+            PlayerId::HOST,
+            &Finish {
+                entity: HOST_ENTITY,
+                generation: 1,
+                time: self.last_finish_time,
+            },
+        );
+        for addr in self.lobby_peers(None) {
+            self.send_reliable(addr, host_finish.clone(), false);
+        }
+        self.race_end_at = Some(Instant::now() + RACE_END_DELAY);
+    }
+
+    /// Send everyone back to the lobby the way a real host does after the
+    /// finish overlay: `RaceEnd`, then a fresh commit of the host garage.
+    /// Clients answer with their own worn `GarageState`.
+    fn end_race(&mut self, why: &str) {
+        let race_end = encode_race_end();
+        let host_garage = encode_garage_commit(PlayerId::HOST, &decode_hex(HOST_GARAGE_HEX));
+        for addr in self.lobby_peers(None) {
+            self.send_reliable(addr, race_end.clone(), true);
+            self.send_reliable(addr, host_garage.clone(), true);
+        }
+        for c in self.clients.values_mut() {
+            c.ready = false;
+            c.finished = false;
+        }
+        self.racing = false;
+        self.first_finish = None;
+        self.race_end_at = None;
+        // Rotate for the next race. Only StartRace carries the map, so lobby
+        // members keep seeing the old minimap until the race loads.
+        self.map_index = (self.map_index + 1) % self.maps.len();
+        println!("race over: {why}; next map {}", self.map().name);
+    }
+
+    fn send(&self, addr: SocketAddr, bytes: &[u8]) {
+        // A failed send to one peer must not take down the server; the client
+        // will be reaped by the timeout if it is truly gone.
+        if let Err(e) = self.socket.send_to(bytes, addr) {
+            eprintln!("send to {addr} failed: {e}");
+        }
+    }
+
+    fn send_unreliable(&self, addr: SocketAddr, payload: Vec<u8>) {
+        self.send(addr, &encode(&Frame::Unreliable(payload)));
+    }
+
+    /// Queue a reliable message: sent now and again every tick until acked.
+    /// Payloads over `CHUNK_SIZE` go out as several packets that share one
+    /// ordered index and a chunk id, each acked on its own.
+    fn send_reliable(&mut self, addr: SocketAddr, payload: Vec<u8>, ordered: bool) {
+        let Some(c) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        let ordered_index = if ordered {
+            let i = c.next_ordered;
+            c.next_ordered += 1;
+            Some(i)
+        } else {
+            None
+        };
+        let chunked = payload.len() > CHUNK_SIZE;
+        let chunk_id = c.next_chunk;
+        if chunked {
+            c.next_chunk += 1;
+        }
+        let total_size = payload.len() as u32;
+        let count = payload.len().div_ceil(CHUNK_SIZE) as u16;
+        let mut out = Vec::with_capacity(count as usize);
+        for (i, piece) in payload.chunks(CHUNK_SIZE).enumerate() {
+            let packet = Packet {
+                payload: piece.to_vec(),
+                seq: c.next_seq,
+                resend: 0,
+                sent_at: unix_seconds(),
+                ordered_index,
+                chunk: chunked.then_some(Chunk {
+                    id: chunk_id,
+                    offset: (i * CHUNK_SIZE) as u32,
+                    total_size,
+                    count,
+                }),
+            };
+            c.next_seq += 1;
+            out.push(encode(&Frame::Reliable(packet.clone())));
+            c.pending.push(Pending {
+                packet,
+                last_sent: Instant::now(),
+            });
+        }
+        for bytes in out {
+            self.send(addr, &bytes);
+        }
+    }
+
+    /// Lobby description for a joining client, in a real host's order:
+    /// everyone already joined, then the host itself (a client stalls at
+    /// "Connecting" without the host entry).
+    fn server_info(&self, joiner: &Client) -> ServerInfo {
+        let mut players: Vec<PlayerInfo> = self
+            .clients
+            .values()
+            .filter(|c| c.id != joiner.id && c.garage.is_some())
+            .map(|c| PlayerInfo {
+                id: c.id,
+                name: c.name().to_string(),
+                avatar: AVATAR,
+            })
+            .collect();
+        players.push(PlayerInfo {
+            id: PlayerId::HOST,
+            name: self.name.clone(),
+            avatar: AVATAR,
+        });
+        ServerInfo {
+            players,
+            applicant: joiner.id,
+            host: PlayerId::HOST,
+            map: self.map().name.clone(),
+            variant: 1,
+            enabled_mods: Vec::new(),
+        }
+    }
+
+    /// Handle one datagram. Returns a description of what happened, for logging.
+    fn handle(&mut self, from: SocketAddr, buf: &[u8]) -> Option<String> {
+        let frame = match parse(buf) {
+            Ok(f) => f,
+            Err(e) => {
+                // Stray traffic on a public port is normal; log and ignore.
+                return Some(format!("ignored {} bytes from {from}: {e}", buf.len()));
+            }
+        };
+
+        // Any valid datagram proves the peer is alive and (re)creates its entry.
+        if !self.clients.contains_key(&from) {
+            let id = self.next_client_id;
+            self.next_client_id += 1;
+            self.clients.insert(from, Client::new(id));
+            println!("client connected: {from} (client id {id})");
+        }
+        let client = self.clients.get_mut(&from).expect("inserted above");
+        client.last_seen = Instant::now();
+
+        match frame {
+            // The greeting is a bare connectivity check: echo it unchanged.
+            Frame::Greeting(id) => {
+                self.send(from, &encode(&Frame::Greeting(id)));
+                if id != GREETING_ID {
+                    return Some(format!("greeting with unexpected id {id} echoed"));
+                }
+                Some("greeting echoed".to_string())
+            }
+
+            Frame::Ack(seq) => {
+                let before = client.pending.len();
+                client.pending.retain(|p| p.packet.seq != seq);
+                if client.pending.len() == before {
+                    return Some(format!("ack {seq} for nothing pending"));
+                }
+                None
+            }
+
+            Frame::Unreliable(payload) => self.handle_unreliable(from, payload),
+
+            Frame::Reliable(p) => {
+                // Ack first, unconditionally: a lost ack is why the peer
+                // retransmits, and a retransmit must not be applied twice.
+                self.send(from, &encode(&Frame::Ack(p.seq)));
+                let client = self.clients.get_mut(&from).expect("present");
+                if client.processed.contains(&p.seq) {
+                    return Some(format!("re-acked seq {} (resend {})", p.seq, p.resend));
+                }
+                client.processed.push(p.seq);
+                if client.processed.len() > 256 {
+                    client.processed.remove(0);
+                }
+                if p.chunk.is_some() {
+                    // Clients have not been seen sending chunked payloads; a
+                    // relay would need reassembly to be correct, so say so.
+                    return Some(format!("dropped chunked seq {} (unsupported)", p.seq));
+                }
+                self.handle_event(from, p.payload)
+            }
+        }
+    }
+
+    fn handle_unreliable(&mut self, from: SocketAddr, payload: Vec<u8>) -> Option<String> {
+        match event_kind(&payload) {
+            Ok(Event::Ping) => {
+                // Echo the clock we were just given, not our own.
+                let clock = clock_of(&payload).ok()?;
+                self.send_unreliable(from, encode_clock(Event::Pong, clock));
+                None
+            }
+            Ok(Event::Pong) => None,
+            Ok(Event::CarState) => {
+                let c = self.clients.get(&from).filter(|c| c.garage.is_some())?;
+                let broadcast = match CarState::decode(&payload) {
+                    Ok(state) => state.encode_broadcast(c.id),
+                    Err(e) => return Some(format!("bad CarState from {from}: {e}")),
+                };
+                self.relay_unreliable(from, &broadcast);
+                None
+            }
+            kind => {
+                let n = self.relay_unreliable(from, &payload);
+                match kind {
+                    Ok(k) => Some(format!("relayed unreliable {k:?} to {n} peer(s)")),
+                    Err(_) => Some(format!("relayed unknown unreliable event to {n} peer(s)")),
+                }
+            }
+        }
+    }
+
+    fn handle_event(&mut self, from: SocketAddr, payload: Vec<u8>) -> Option<String> {
+        let kind = event_kind(&payload);
+        match kind {
+            Ok(Event::ClientInfo) => {
+                let info = match ClientInfo::decode(&payload) {
+                    Ok(i) => i,
+                    Err(e) => return Some(format!("bad ClientInfo from {from}: {e}")),
+                };
+                let client = self.clients.get_mut(&from).expect("present");
+                let id = client.id;
+                println!(
+                    "{from} identifies as {:?} (client id {})",
+                    info.name, id.client_id
+                );
+                let joined = info.encode_joined(id);
+                client.info = Some(info);
+
+                // Mirror a real host: describe the lobby, commit the host
+                // garage, then one commit per player already in it, all
+                // retransmitted until acked. Existing members are told about
+                // the newcomer now; its garage follows once it arrives.
+                let server_info = self.server_info(&self.clients[&from]).encode();
+                self.send_reliable(from, server_info, false);
+                let mut commits = vec![encode_garage_commit(
+                    PlayerId::HOST,
+                    &decode_hex(HOST_GARAGE_HEX),
+                )];
+                commits.extend(
+                    self.clients
+                        .values()
+                        .filter(|c| c.id != id)
+                        .filter_map(|c| {
+                            let garage = c.garage.as_ref()?;
+                            Some(encode_garage_commit(c.id, garage))
+                        }),
+                );
+                let n = commits.len();
+                for commit in commits {
+                    self.send_reliable(from, commit, false);
+                }
+                for addr in self.lobby_peers(Some(from)) {
+                    self.send_reliable(addr, joined.clone(), false);
+                }
+                Some(format!(
+                    "client info -> lobby described, {n} garage commit(s)"
+                ))
+            }
+
+            Ok(Event::GarageState) => {
+                // The client's garage completes the join, and comes again after
+                // each race with worn conditions. Its body is opaque here; it
+                // is kept so it can be committed to everyone else, which is
+                // how they see the newcomer's (or refreshed) car.
+                let client = self.clients.get_mut(&from).expect("present");
+                let joining = client.garage.is_none();
+                client.garage = Some(payload.clone());
+                let id = client.id;
+                if joining {
+                    println!(
+                        "client joined lobby: {from} ({}, client id {})",
+                        client.name(),
+                        id.client_id
+                    );
+                }
+                let n = self.broadcast_reliable(from, encode_garage_commit(id, &payload));
+                Some(format!("garage state -> committed to {n} peer(s)"))
+            }
+
+            Ok(Event::CrossedFinish) => {
+                let finish = match decode_crossed_finish(&payload) {
+                    Ok(f) => f,
+                    Err(e) => return Some(format!("bad CrossedFinish from {from}: {e}")),
+                };
+                if !self.racing {
+                    return Some("crossed finish outside a race (ignored)".to_string());
+                }
+                self.car_finished(from, finish);
+                Some(format!("crossed finish at {:.3} s", finish.time))
+            }
+
+            Ok(Event::Ready) => {
+                let ready = match decode_ready(&payload) {
+                    Ok(r) => r,
+                    Err(e) => return Some(format!("bad Ready from {from}: {e}")),
+                };
+                let client = self.clients.get_mut(&from).expect("present");
+                let changed = client.ready != ready;
+                client.ready = ready;
+                let broadcast = encode_ready_broadcast(client.id, ready);
+                let n = self.broadcast_reliable(from, broadcast);
+                if self.racing {
+                    // The grid "press any button" confirm reuses Ready. A real
+                    // host confirms last and then sends its own ReadyBroadcast
+                    // plus RaceGo (bccap5 host lines 7799-7800); the phantom
+                    // host confirms the moment the last client does.
+                    let all_confirmed = self
+                        .clients
+                        .values()
+                        .filter(|c| c.garage.is_some())
+                        .all(|c| c.ready);
+                    if changed && all_confirmed {
+                        let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
+                        let go = encode_race_go();
+                        for addr in self.lobby_peers(None) {
+                            self.send_reliable(addr, host_ready.clone(), true);
+                            self.send_reliable(addr, go.clone(), false);
+                        }
+                        return Some(format!(
+                            "race confirm ready={ready} -> everyone confirmed, go"
+                        ));
+                    }
+                    return Some(format!(
+                        "race confirm ready={ready} -> broadcast to {n} peer(s)"
+                    ));
+                }
+                let joined: Vec<&Client> = self
+                    .clients
+                    .values()
+                    .filter(|c| c.garage.is_some())
+                    .collect();
+                if !joined.is_empty() && joined.iter().all(|c| c.ready) {
+                    self.start_race();
+                    return Some(format!("ready={ready} -> everyone ready, race started"));
+                }
+                Some(format!("ready={ready} -> broadcast to {n} peer(s)"))
+            }
+
+            Ok(Event::Disconnect) => {
+                // A real host also keeps retransmitting PlayerLeft to the
+                // leaver, which never acks; dropping it here is equivalent.
+                self.remove_client(from, "disconnected");
+                Some("disconnect -> player left".to_string())
+            }
+
+            // Everything else, including events this server does not model,
+            // is relayed to the other lobby members as a listen server would.
+            _ => {
+                let n = self.broadcast_reliable(from, payload);
+                match kind {
+                    Ok(k) => Some(format!("relayed {k:?} to {n} peer(s)")),
+                    Err(e) => Some(format!("relayed unknown event to {n} peer(s) ({e})")),
+                }
+            }
+        }
+    }
+
+    /// Everyone in the lobby, optionally minus one address.
+    fn lobby_peers(&self, except: Option<SocketAddr>) -> Vec<SocketAddr> {
+        self.clients
+            .iter()
+            .filter(|(addr, c)| Some(**addr) != except && c.garage.is_some())
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// Forget a client and tell the lobby its slot is gone, if it ever had one.
+    fn remove_client(&mut self, addr: SocketAddr, why: &str) {
+        let Some(c) = self.clients.remove(&addr) else {
+            return;
+        };
+        println!(
+            "client {why}: {addr} ({}, client id {})",
+            c.name(),
+            c.id.client_id
+        );
+        if c.garage.is_some() {
+            let left = encode_player_left(c.id);
+            for peer in self.lobby_peers(None) {
+                self.send_reliable(peer, left.clone(), false);
+            }
+        }
+        if self.racing && self.lobby_peers(None).is_empty() {
+            self.end_race("lobby empty");
+        } else if self.racing {
+            // The leaver may have been the last one still driving.
+            self.settle_finish();
+        }
+    }
+
+    fn broadcast_reliable(&mut self, from: SocketAddr, payload: Vec<u8>) -> usize {
+        let targets = self.lobby_peers(Some(from));
+        for addr in &targets {
+            self.send_reliable(*addr, payload.clone(), true);
+        }
+        targets.len()
+    }
+
+    fn relay_unreliable(&self, from: SocketAddr, payload: &[u8]) -> usize {
+        let targets = self.lobby_peers(Some(from));
+        let bytes = encode(&Frame::Unreliable(payload.to_vec()));
+        for addr in &targets {
+            self.send(*addr, &bytes);
+        }
+        targets.len()
+    }
+
+    /// Once a second: evict silent clients, retransmit unacked packets, ping.
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<SocketAddr> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| now.duration_since(c.last_seen) > CLIENT_TIMEOUT)
+            .map(|(a, _)| *a)
+            .collect();
+        for addr in stale {
+            self.remove_client(addr, "timed out");
+        }
+
+        let mut resends: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        for (addr, c) in self.clients.iter_mut() {
+            c.pending.retain(|p| p.packet.resend < MAX_RESENDS);
+            for p in c.pending.iter_mut() {
+                if now.duration_since(p.last_sent) < TICK {
+                    continue;
+                }
+                p.packet.resend += 1;
+                p.last_sent = now;
+                resends.push((*addr, encode(&Frame::Reliable(p.packet.clone()))));
+            }
+        }
+        for (addr, bytes) in resends {
+            self.send(addr, &bytes);
+        }
+
+        let ping = encode(&Frame::Unreliable(encode_clock(
+            Event::Ping,
+            self.started.elapsed().as_secs_f32(),
+        )));
+        for addr in self.clients.keys() {
+            self.send(*addr, &ping);
+        }
+    }
+
+    fn run(&mut self) -> std::io::Result<()> {
+        // Short read timeout so timers stay on schedule without a second
+        // thread; the loop wakes, fires what is due, and goes back to waiting.
+        self.socket
+            .set_read_timeout(Some(Duration::from_millis(10)))?;
+
+        let host_state = encode(&Frame::Unreliable(decode_hex(HOST_CAR_STATE_HEX)));
+        let mut buf = [0u8; 65536];
+        let mut next_tick = Instant::now() + TICK;
+        let mut next_car_state = Instant::now();
+
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    if let Some(what) = self.handle(from, &buf[..n]) {
+                        println!("{from} ({n}B): {what}");
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                Err(e) => return Err(e),
+            }
+
+            let now = Instant::now();
+            if now >= next_tick {
+                self.tick();
+                next_tick = now + TICK;
+            }
+            if self.racing && now >= next_car_state {
+                for addr in self.lobby_peers(None) {
+                    self.send(addr, &host_state);
+                }
+                next_car_state = now + CAR_STATE_INTERVAL;
+            }
+            if self.racing {
+                let grace_out = self
+                    .first_finish
+                    .is_some_and(|t| now.duration_since(t) >= FINISH_GRACE);
+                if self.race_end_at.is_some_and(|t| now >= t) {
+                    self.end_race("everyone finished");
+                } else if grace_out {
+                    self.end_race("finish grace expired");
+                }
+            }
+        }
+    }
+}
+
+const USAGE: &str = "usage: beatermp [--port N] [--name NAME] [--map MAP]... [--list-maps]
+  --port N     UDP port (default 6237, the only one unpatched clients reach)
+  --name NAME  host name shown in the lobby (default beatermp)
+  --map MAP    map to race; repeat to rotate through several (default forest_long)
+  --list-maps  print the maps this build knows and exit";
+
+fn main() {
+    let mut port = DEFAULT_PORT;
+    let mut name = "beatermp".to_string();
+    let mut maps: Vec<Map> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next().unwrap_or_else(|| {
+                eprintln!("{arg} needs a value\n{USAGE}");
+                std::process::exit(2);
+            })
+        };
+        match arg.as_str() {
+            "--port" => {
+                port = value().parse().unwrap_or_else(|_| {
+                    eprintln!("port must be a number\n{USAGE}");
+                    std::process::exit(2);
+                })
+            }
+            "--name" => name = value(),
+            "--map" => {
+                let map = value();
+                maps.push(Map::load(&map).unwrap_or_else(|| {
+                    eprintln!("unknown map {map:?}; see --list-maps");
+                    std::process::exit(2);
+                }));
+            }
+            "--list-maps" => {
+                for name in Map::names() {
+                    println!("{name}");
+                }
+                return;
+            }
+            _ => {
+                eprintln!("unexpected argument {arg:?}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if maps.is_empty() {
+        maps.push(Map::load(DEFAULT_MAP).expect("default map is in the table"));
+    }
+
+    let socket = UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
+        eprintln!("failed to bind 0.0.0.0:{port}: {e}");
+        std::process::exit(1);
+    });
+
+    let rotation: Vec<&str> = maps.iter().map(|m| m.name.as_str()).collect();
+    println!(
+        "beatermp listening on 0.0.0.0:{port} as {name:?}, maps {}",
+        rotation.join(", ")
+    );
+
+    let mut server = Server::new(socket, name, maps);
+    if let Err(e) = server.run() {
+        eprintln!("server error: {e}");
+        std::process::exit(1);
+    }
+}

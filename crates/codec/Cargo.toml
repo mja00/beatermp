@@ -1,0 +1,9 @@
+[package]
+name = "beatermp-codec"
+description = "Wire codec for BeaterCore's UDP multiplayer protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

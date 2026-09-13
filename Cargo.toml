@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/codec", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mja00/beatermp"
+
+[workspace.dependencies]
+beatermp-codec = { path = "crates/codec" }
