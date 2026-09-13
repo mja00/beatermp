@@ -144,7 +144,7 @@ count from `(1, 1)`.
 | 12 | CarStateBroadcast | host -> all | `PlayerId owner`, `u32 entity`, `u32 generation`, 94-byte state; unreliable, ~20 Hz |
 | 13 | PlayerJoined | host -> lobby | `PlayerId`, ClientInfo body |
 | 14 | ServerInfo | host -> joiner | `Vec<(PlayerId, name, [u8;5] avatar)>`, `PlayerId applicant`, `PlayerId host`, map, `u32 variant`, `Vec<String> mods` |
-| 15 | ClientInfo | client -> host | name, `u64 0` |
+| 15 | ClientInfo | client -> host | name, `HashMap<ModName, u64>` of enabled mods (the `u64` is the empty-map count in every capture) |
 | 16 | GarageState | client -> host | 420-byte car description |
 | 17 | GarageStateCommit | host -> client | `PlayerId owner`, GarageState body |
 | 18 | LobbyChangeMap | host -> lobby | map name, `u32 variant` (1 Default, 2 Reverse, 3 Alternative, 4 TimeAttack, 5 TimeAttackReverse); ordered |
@@ -203,6 +203,13 @@ sender's `PlayerId`.
 `docs/notes/bodies.md` has the byte-level walk of the GarageState body;
 `docs/notes/parity.md` lists what still differs from a real host and how to
 close it.
+
+Full protocol coverage, including the parts this server does not implement
+(master-server rendezvous on `209.250.240.105:4321`, NAT punch-through, Steam
+NetworkingSockets/Matchmaking, Workshop/UGC, Steam Input and Cloud), is in
+`docs/protocols.md`. Every file format the game reads or writes -- mods and
+Workshop items, scenes, saves, personal bests, replays, settings and
+localization -- is in `docs/packs.md`.
 
 ## Tools
 
