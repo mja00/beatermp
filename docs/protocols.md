@@ -4,6 +4,9 @@ Every wire protocol BeaterCore speaks, with the evidence each claim rests on.
 The game is the Linux `beaterCore` binary (Steam AppID 3711050); addresses are
 file virtual addresses in that binary, so they resolve directly with
 `objdump -d`, `nm -C`, or the Ghidra project in `tools/re/export_decomp.py`.
+They come from the build before the 2026-09-14 update, which moved every
+address but changed nothing in this document; the binary is not stripped, so
+re-resolve any of them by name with `nm -C beaterCore`.
 
 Companion documents: `docs/packs.md` (file formats), `README.md` (the
 `beatermp` server), `docs/notes/parity.md` and `docs/notes/bodies.md` (the
@@ -279,6 +282,11 @@ datagram layer differs. Falls back to Steam-disabled operation when
   (`Game::update` closure and `Hub::ui_render` closures), `leave_lobby` leaves.
 - `client_steam_connect` (`0x538700`) maps a chosen lobby/SteamId to
   `connect_by_steamid`.
+
+A bridge that makes `beatermp` appear in the client's Server list — a lobby as
+AppID 3711050 plus a raw-event P2P relay to the UDP server — lives in
+`crates/steam` (`beatermp-steam`); the reverse-engineered lobby contract and
+transport framing are in `docs/notes/steam-browser.md`.
 
 Steam interface getters imported by the binary (i.e. the full set of Steam
 subsystems the game touches): `ISteamNetworkingSockets`,

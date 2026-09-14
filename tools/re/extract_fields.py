@@ -4,9 +4,12 @@
 serde's derive emits, for every struct/enum it serialises, a static
 ``&'static [&'static str]`` table of field (or variant) names, referenced from
 the generated ``Serialize``/``Deserialize`` impl. rustc merges string literals
-into one rodata blob and represents each ``&str`` as a (pointer, length) pair,
-so a field table is a contiguous run of 16-byte entries whose pointer lands
-inside the blob and whose bytes at that pointer equal the name.
+into rodata and represents each ``&str`` as a (pointer, length) pair, so a
+field table is a contiguous run of 16-byte entries pointing at identifiers.
+
+The binary is a PIE, so those pointers are zero in the file and live as
+``R_X86_64_RELATIVE`` addends instead; the in-file pairs are read as well so a
+non-PIE build still works.
 
 Scanning for those runs recovers the field names *in declaration order*, which
 is exactly the order bincode writes them in. Field names alone are not enough
@@ -14,7 +17,7 @@ to decode a packet -- widths come from the type declarations -- but they turn
 "here is a 40-byte blob" into "this is ServerInfo.host, ServerInfo.map, ...".
 
 Usage:
-    extract_fields.py <binary> [--json out.json] [--blob <substring>]
+    extract_fields.py <binary> [--json out.json] [--min N]
 
 Prints one line per recovered table:
     <address>  <n>  name1 name2 name3 ...
@@ -24,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
+import subprocess
 import sys
 
 PT_LOAD = 1
@@ -78,62 +83,69 @@ class Elf:
         return out
 
 
-def blob_vaddr(elf: Elf, marker: bytes) -> tuple[int, int] | None:
-    """Locate a marker in the file and return (vaddr, file_offset)."""
-    foff = elf.data.find(marker)
-    if foff < 0:
+def relative_relocs(path: str) -> dict[int, int]:
+    """{entry vaddr: addend} for every R_X86_64_RELATIVE relocation."""
+    out: dict[int, int] = {}
+    txt = subprocess.run(["readelf", "-rW", path], capture_output=True, text=True).stdout
+    for line in txt.splitlines():
+        m = re.match(r"([0-9a-f]{8,})\s+\S+\s+R_X86_64_RELATIVE\s+([0-9a-f]+)\s*$", line.strip())
+        if m:
+            out[int(m.group(1), 16)] = int(m.group(2), 16)
+    return out
+
+
+def identifier_at(elf: Elf, ptr: int, length: int) -> str | None:
+    """The identifier a (ptr,len) string description points at, if it is one."""
+    if not 0 < length <= 64:
         return None
-    for p_vaddr, p_offset, p_filesz, _flags, _i in elf.segments:
-        if p_offset <= foff < p_offset + p_filesz:
-            return p_vaddr + (foff - p_offset), foff
-    return None
+    if not any(lo <= ptr and ptr + length <= lo + n for lo, n in elf.rodata_ranges()):
+        return None
+    raw = elf.read_vaddr(ptr, length)
+    if raw is None:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # Field names are plain identifiers; reject anything else so we do not
+    # latch onto unrelated (ptr,len) pairs that happen to align.
+    if not text.replace("_", "").isalnum():
+        return None
+    if not (text[0].isalpha() or text[0] == "_"):
+        return None
+    return text
 
 
-def collect_strings(elf: Elf, blob_vaddr: int, blob_len: int) -> dict[int, str]:
-    """Enumerate every plausible (ptr,len) string description anchored in the blob.
-
-    Returns {file_offset_of_16byte_entry: text}. Only entries whose pointer lies
-    inside the blob and whose declared length actually matches the bytes are kept.
-    """
+def collect_strings(elf: Elf, relocs: dict[int, int]) -> dict[int, str]:
+    """{vaddr of the 16-byte entry: identifier} for every string description."""
     found: dict[int, str] = {}
-    for p_vaddr, p_offset, p_filesz, _flags, _i in elf.segments:
-        if _flags & 0x2:  # skip writable; serde tables are const
+    for vaddr, addend in relocs.items():  # PIE: pointer is the reloc addend
+        raw = elf.read_vaddr(vaddr + 8, 8)
+        if raw is None:
             continue
-        end = p_offset + p_filesz - 16
-        for off in range(p_offset, end, 8):
-            ptr, ln = struct.unpack_from("<QQ", elf.data, off)
-            if not (blob_vaddr <= ptr < blob_vaddr + blob_len):
+        (length,) = struct.unpack("<Q", raw)
+        text = identifier_at(elf, addend, length)
+        if text is not None:
+            found[vaddr] = text
+    for p_vaddr, p_offset, p_filesz, _flags, _i in elf.segments:  # non-PIE
+        for off in range(p_offset, p_offset + p_filesz - 16, 8):
+            ptr, length = struct.unpack_from("<QQ", elf.data, off)
+            if ptr == 0:
                 continue
-            if ln == 0 or ln > 64:
-                continue
-            text_off = elf.vaddr_to_offset(ptr)
-            if text_off is None:
-                continue
-            raw = elf.data[text_off : text_off + ln]
-            if len(raw) != ln:
-                continue
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            # Field names are plain identifiers; reject anything else so we do
-            # not latch onto unrelated (ptr,len) pairs that happen to align.
-            if not text.replace("_", "").isalnum():
-                continue
-            if not (text[0].isalpha() or text[0] == "_"):
-                continue
-            found[off] = text
+            text = identifier_at(elf, ptr, length)
+            if text is not None:
+                found[p_vaddr + (off - p_offset)] = text
     return found
 
 
-def group_entries(elf: Elf, entries: dict[int, str]) -> list[tuple[int, list[str]]]:
+def group_entries(entries: dict[int, str]) -> list[tuple[int, list[str]]]:
     """Merge adjacent 16-byte entries into ordered tables."""
     tables: list[tuple[int, list[str]]] = []
-    for off in sorted(entries):
-        if tables and off == tables[-1][0] + 16 * len(tables[-1][1]):
-            tables[-1][1].append(entries[off])
+    for vaddr in sorted(entries):
+        if tables and vaddr == tables[-1][0] + 16 * len(tables[-1][1]):
+            tables[-1][1].append(entries[vaddr])
         else:
-            tables.append((off, [entries[off]]))
+            tables.append((vaddr, [entries[vaddr]]))
     return tables
 
 
@@ -141,45 +153,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("binary")
     ap.add_argument("--json", help="write results as JSON to this path")
-    ap.add_argument(
-        "--blob",
-        default="Packetidgeneration",
-        help="marker locating the merged string blob (default: %(default)s)",
-    )
     ap.add_argument("--min", type=int, default=2, help="minimum fields per table")
     args = ap.parse_args()
 
     elf = Elf(args.binary)
-    marker = args.blob.encode()
-    loc = blob_vaddr(elf, marker)
-    if loc is None:
-        raise SystemExit(f"marker {marker!r} not found in {args.binary}")
-    bv, _boff = loc
-
-    # The merged blob is contiguous; bound it by walking forward while bytes
-    # remain printable, which is where all merged literals live.
-    blob_len = 0
-    while bv + blob_len < bv + 200_000:
-        off = elf.vaddr_to_offset(bv + blob_len)
-        if off is None:
-            break
-        ch = elf.data[off]
-        if ch == 0 or not (32 <= ch < 127):
-            break
-        blob_len += 1
-
-    entries = collect_strings(elf, bv, blob_len)
-    tables = [(off, names) for off, names in group_entries(elf, entries) if len(names) >= args.min]
+    entries = collect_strings(elf, relative_relocs(args.binary))
+    tables = [(v, names) for v, names in group_entries(entries) if len(names) >= args.min]
 
     results = []
-    for off, names in tables:
-        vaddr = None
-        for p_vaddr, p_offset, p_filesz, _flags, _i in elf.segments:
-            if p_offset <= off < p_offset + p_filesz:
-                vaddr = p_vaddr + (off - p_offset)
-                break
-        results.append({"vaddr": vaddr, "offset": off, "fields": names})
-        print(f"0x{vaddr or 0:x}  {len(names):3d}  {' '.join(names)}")
+    for vaddr, names in tables:
+        results.append({"vaddr": vaddr, "offset": elf.vaddr_to_offset(vaddr), "fields": names})
+        print(f"0x{vaddr:x}  {len(names):3d}  {' '.join(names)}")
 
     if args.json:
         with open(args.json, "w") as fh:

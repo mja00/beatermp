@@ -50,9 +50,10 @@ Notes:
   tick LAN, Create server. `tools/udpsniff/capture_session.sh` does exactly
   this for a host on `:99` and a joining client on `:98`, and is the reference
   for the click coordinates (960x600 window).
-- Forward **UDP 6237** to the machine. To change the port, patch the literal
-  `"0.0.0.0:6237"` at file offset `0x9bab2` in `beaterCore` in place (same
-  length, e.g. `"0.0.0.0:6238"`).
+- Forward **UDP 6237** to the machine. To change the port, patch the sole
+  occurrence of the literal `"0.0.0.0:6237"` in `beaterCore` in place (same
+  length, e.g. `"0.0.0.0:6238"`). Its file offset moves with every game build
+  (`0x9b639` in build 25292963), so search for the string rather than seeking.
 - The game ignores SIGTERM; stop it with `kill -9`.
 
 The host is a normal player: it appears in the lobby, must tick Ready, and

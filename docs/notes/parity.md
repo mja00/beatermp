@@ -18,6 +18,27 @@ dispatch tables and the serde name strings, so every discriminant, its body
 shape and (for tuple variants) its real name are known. See
 "Recovered: the NetworkEvent enum" below.
 
+## Re-checked against game build 25292963 (2026-09-14 update)
+
+Nothing in the protocol moved. Re-derived from the new binary: the
+`NetworkEvent` jump table is still 49 variants `0..=48` with the same shapes
+and tuple names; `broadcast_equivalent` (now `0x3e37a0`) still maps exactly
+`6->7, 8->9, 11->12, 16->17, 19->20, 25->26, 27->28, 29->30, 31->32, 39->40,
+41->42, 43->46, 44->47, 45->48` plus verbatim `0`, i.e. `codec::broadcast_twin`
+unchanged; `Server::run` still checks the greeting against `0x101`; the serde
+field tables (`CarDeriative` 24, `LocalServerInfo` 6, `AvatarState` 4) are
+identical; `tools/re/spawns.py` reproduces `crates/server/maps.txt` byte for
+byte. A live join with the updated client (`join_client.sh`) completed the
+handshake, lobby, race start, grid confirm and RaceGo, with the same payload
+sizes (ClientInfo 49 B, GarageState 448 B, SpawnCar 472 B chunked 450+22).
+
+Only addresses moved, which broke the two RE tools that hard-coded them.
+`network_events.py` now resolves `visit_enum`, its jump table and the variant
+count from the symbol table and the disassembly; `extract_fields.py` reads the
+`R_X86_64_RELATIVE` addends (the binary is a PIE, so the string-table pointers
+are zero in the file) instead of anchoring on a literal blob marker. The
+listen-address literal is at `0x9b639` in this build, not `0x9bab2`.
+
 ## Left
 
 Checklist against a real host, roughly highest value first. Captures in

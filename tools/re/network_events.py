@@ -21,6 +21,9 @@ Usage:
 
 Requires `binutils` (`objdump`, `readelf`, `nm`) on PATH.
 
+Every address is resolved from the binary itself (symbols plus the jump-table
+`lea`), so a game update only invalidates the results if the enum itself moved.
+
 Caveat: a variant that is a newtype over an inline scalar (e.g. `Disconnect`'s
 `DisconnectReason`, `UpdateLocation`'s `Location`) has no call to anchor on, so
 it is reported as `unit`; correct those from captures. Tuple variants and
@@ -36,12 +39,16 @@ import struct
 import subprocess
 import sys
 
-# `NetworkEvent as Deserialize>::deserialize::__Visitor as Visitor>::visit_enum`
-VISIT_ENUM = 0x3D14C0
-VISIT_ENUM_END = 0x3D20BB
-# jump table at the top of visit_enum, indexed by the serde field byte
-DISPATCH_TABLE = 0x9B33C
-N_VARIANTS = 49
+# `::<` pins the monomorphised function itself: the `tuple_variant` symbols
+# embed the same path as `visit_enum::__Visitor`.
+VISIT_ENUM_SYM = (
+    "NetworkEvent as serde_core::de::Deserialize>::deserialize::__Visitor"
+    " as serde_core::de::Visitor>::visit_enum::<"
+)
+VISIT_U32_SYM = (
+    "NetworkEvent as serde_core::de::Deserialize>::deserialize::__FieldVisitor"
+    " as serde_core::de::Visitor>::visit_u32::<"
+)
 
 
 class Elf:
@@ -104,6 +111,49 @@ def symbol_table(path: str) -> dict[int, str]:
     return syms
 
 
+def locate(path: str) -> tuple[int, int, int, int]:
+    """(visit_enum, visit_enum_end, dispatch table, variant count) read from the binary."""
+    out = subprocess.run(["nm", "-C", "-S", path], capture_output=True, text=True).stdout
+    enum_fn = u32_fn = None
+    for line in out.splitlines():
+        m = re.match(r"([0-9a-f]+)\s+([0-9a-f]+)\s+\S\s+(.*)", line)
+        if not m:
+            continue
+        addr, size, name = int(m.group(1), 16), int(m.group(2), 16), m.group(3)
+        if VISIT_ENUM_SYM in name:
+            enum_fn = (addr, addr + size)
+        elif VISIT_U32_SYM in name:
+            u32_fn = (addr, addr + size)
+    if enum_fn is None or u32_fn is None:
+        raise SystemExit(f"{path}: NetworkEvent deserialiser symbols not found (stripped?)")
+
+    # serde's field visitor rejects out-of-range ids with `cmp $max,%esi; ja err`.
+    n_variants = None
+    for _, txt in disassemble(path, *u32_fn):
+        m = re.match(r"cmp\s+\$0x([0-9a-f]+),%esi", txt)
+        if m:
+            n_variants = int(m.group(1), 16) + 1
+            break
+    if n_variants is None:
+        raise SystemExit(f"{path}: no variant bound in visit_u32")
+
+    # the arm jump table: `lea tbl(%rip),%reg; movslq (%reg,%idx,4),%rax`.
+    table = None
+    pending: dict[str, int] = {}
+    for _, txt in disassemble(path, *enum_fn):
+        m = re.match(r"lea\s+-?0x[0-9a-f]+\(%rip\),(%\w+)\s+#\s+([0-9a-f]+)", txt)
+        if m:
+            pending[m.group(1)] = int(m.group(2), 16)
+            continue
+        m = re.match(r"movslq\s+\((%\w+),%\w+,4\)", txt)
+        if m and m.group(1) in pending:
+            table = pending[m.group(1)]
+            break
+    if table is None:
+        raise SystemExit(f"{path}: no dispatch table in visit_enum")
+    return enum_fn[0], enum_fn[1], table, n_variants
+
+
 def expected_string(elf: Elf, relocs: dict[int, int], addr: int) -> str | None:
     """Read a `&'static str` whose pointer is a RELATIVE relocation at `addr`."""
     if addr not in relocs:
@@ -133,16 +183,17 @@ def main() -> int:
     relocs = elf.relative_relocs()
     syms = symbol_table(args.binary)
     sym_addrs = sorted(syms)
-    lines = disassemble(args.binary, VISIT_ENUM, VISIT_ENUM_END)
+    visit_enum, visit_enum_end, dispatch_table, n_variants = locate(args.binary)
+    lines = disassemble(args.binary, visit_enum, visit_enum_end)
     by_addr = {a: i for i, (a, _) in enumerate(lines)}
 
-    table = elf.read(DISPATCH_TABLE, N_VARIANTS * 4)
+    table = elf.read(dispatch_table, n_variants * 4)
     if table is None:
-        raise SystemExit(f"{args.binary}: no dispatch table at 0x{DISPATCH_TABLE:x}")
+        raise SystemExit(f"{args.binary}: no dispatch table at 0x{dispatch_table:x}")
     arms = []
-    for i in range(N_VARIANTS):
+    for i in range(n_variants):
         (rel,) = struct.unpack_from("<i", table, i * 4)
-        arms.append(DISPATCH_TABLE + rel)
+        arms.append(dispatch_table + rel)
 
     def resolved(addr: int) -> str:
         base = max((k for k in sym_addrs if k <= addr), default=None)
@@ -168,7 +219,7 @@ def main() -> int:
         idx = by_addr.get(start)
         if idx is None:
             return info
-        region_end = next((a for a in arm_ends if a > start), VISIT_ENUM_END)
+        region_end = next((a for a in arm_ends if a > start), visit_enum_end)
         arity = None
         tuple_fn = None
         for k in range(idx, len(lines)):
