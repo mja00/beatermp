@@ -117,16 +117,25 @@ transport (raw `NetworkEvent`s, no `Frame` envelope) and beatermp's UDP frames:
 
 ```sh
 ./target/release/beatermp --name "My Server" &
-cargo run -p beatermp-steam --features steam -- --data-file players.jsonl
+cargo run -p beatermp-steam --features steam -- --name "My Server" --data-file players.jsonl
 ```
 
 It needs the Steam client running and logged in with an account that owns
 BeaterCore (the initialisation is opt-in; the default workspace build is
-Steam-free). `--data-file` appends one JSON line per lobby/identity event:
-lobby creation, connects and disconnects, and each client's name and
-enabled-mod count. The recovered lobby-list and transport contract is in
-`docs/notes/steam-browser.md`. A lobby appearing in the client's Server list
-can only be verified with a live Steam session, so that check is manual.
+Steam-free). The bridge's `--name` is the lobby's `name` key, which is the only
+lobby data the client reads: the Server list renders `{name} {members}/{limit}`
+and falls back to `Unnamed server` when the key is missing. `beatermp`'s own
+`--name` is unrelated, it names the phantom host player. `--data-file` appends
+one JSON line per lobby/identity event: lobby creation, connects and
+disconnects, and each client's name and enabled-mod count.
+
+A client that clicks the entry is sent to `ConnectP2P(lobby owner)`, so **the
+joining game must run on a different Steam account than the bridge**: Steam
+returns an invalid connection handle for a P2P connect to your own identity,
+and the game reports "Connection error: Unknown" without the bridge ever
+seeing a connection request. Nothing has to be forwarded on the router, the
+traffic rides Steam's relays. The recovered lobby-list and transport contract,
+and what has been verified live, is in `docs/notes/steam-browser.md`.
 
 ## Protocol
 

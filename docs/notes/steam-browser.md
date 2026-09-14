@@ -37,11 +37,16 @@ connect; it is not a separate list protocol.
 - **No list filters.** The only imported matchmaking list APIs are
   `RequestLobbyList` and `GetLobbyByIndex`; there is no `AddRequestLobbyList*`
   import at all. The list is therefore every lobby for AppID 3711050.
-- **No lobby data.** `GetLobbyData` is called only inside
-  `Matchmaking::lobby_data` (`0x825330`), and `SetLobbyData` only inside
-  `Matchmaking::set_lobby_data` (`0x8254b0`). Neither function has a caller
-  (no direct call, no function-pointer reference), so this build never sets or
-  reads lobby data. A lobby needs **no keys** to appear or be joinable.
+- **One lobby key: `name`.** A Server-list row is formatted
+  `{name} {members}/{limit}` from `GetLobbyData(lobby, "name")` (call through
+  the `Matchmaking::lobby_data` pointer at `0x6a1641`, key literal at
+  `0x7b3c0`, length 4), `lobby_member_count` (`0x6a16e7`) and
+  `lobby_member_limit` (`0x6a16fe`). An empty or missing `name` falls back to
+  the literal `Unnamed server` (`0x6a1666`). A real host writes its
+  "Server name:" field (`hub_popup_mp_server_name`, default
+  `beaterCore Server`) with `SetLobbyData(lobby, "name", ...)` in
+  `Game::update` (`0x38ee2f`) as soon as the lobby exists. No other key is
+  read or written, and no key is needed for the lobby to be listed or joined.
 
 Host side (`SteamNetworkingServer::new`, `0x78afc0`):
 
@@ -105,20 +110,26 @@ Build and run (needs Steam running, game owned):
 
 ```sh
 ./target/release/beatermp &
-cargo run -p beatermp-steam --features steam -- --port 6237 --data-file players.jsonl
+cargo run -p beatermp-steam --features steam -- --port 6237 --name "My Server" --data-file players.jsonl
 ```
 
-## 6. Verification (blocked on a Steam session)
+## 6. Verification
 
-The probe that would prove this is: run a Steamworks process as AppID 3711050,
-`create_lobby(Public, 6)`, keep it alive, and open BeaterCore's Server list. It
-needs, on one machine: the Steam client running and logged in, an account that
-owns BeaterCore (installed here:
-`/mnt/data-drive/SteamLibrary/steamapps/appmanifest_3711050.acf`), and the game
-client to view the list. None of that is available in this environment - the
-Steam client is not running - so the end-to-end check must be run by hand.
+Checked live against build 25292963 with the Steam client logged in:
 
-## 6. Evidence index
+- **Listing and naming work.** `beatermp-steam --name "Matta's beatermp"`
+  creates the lobby, sets the `name` key, and the client's Server list renders
+  `1. Matta's beatermp 1/6`. Without the key the row reads `Unnamed server`.
+- **A client cannot join a bridge on its own Steam account.** `ConnectP2P` to
+  your own identity returns `k_HSteamNetConnection_Invalid` immediately: with
+  two processes on one account, the connecting side got an invalid handle and
+  the listen socket never saw a `Connecting` request. The game then logs
+  `Connecting by steamId <own id>` and shows `connection_error_unknown`
+  ("Connection error: Unknown"). This is a Steam identity limit, not a
+  NAT/port-forwarding one - P2P traffic rides Steam's relays. Testing the join
+  needs the bridge and the game on two different Steam accounts.
+
+## 7. Evidence index
 
 | Claim | Address / symbol |
 |---|---|
@@ -126,7 +137,8 @@ Steam client is not running - so the end-to-end check must be run by hand.
 | Result callback collects `LobbyId`s | `LobbyMatchList_t` shim `0x74bcc0`; `GetLobbyByIndex` `0x74bd46` |
 | No custom-master list query | master string refs: `register_room` `0x3d5f20`, `nat_punch_connect` `0x3d5290` only |
 | No lobby-list filters | no `AddRequestLobbyList*` imports |
-| No lobby data used | `lobby_data` `0x825330`, `set_lobby_data` `0x8254b0`, both uncalled |
+| Server-list row reads the `name` key | `lobby_data` call `0x6a1641` with key `0x7b3c0` ("name", len 4); `Unnamed server` fallback `0x6a1666`; counts `0x6a16e7`/`0x6a16fe` |
+| Host writes the `name` key | `SetLobbyData` call `0x38ee2f` in `Game::update`, same key literal |
 | Lobby create type/max | `SteamNetworkingServer::new` `0x78afc0` (type `2 - friends_only`, max 6) |
 | Join by SteamID | `connect_by_steamid` `0x78b290` |
 | Steam send flags 8/0 | `SteamNetworkingClient::{send_reliable,send}` `0x7a50b0`/`0x7a53a0` |

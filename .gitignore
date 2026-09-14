@@ -2,3 +2,4 @@ target/
 tools/udpsniff/udpsniff.so
 __pycache__/
 .commandcode/
+players.jsonl

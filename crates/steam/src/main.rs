@@ -29,8 +29,14 @@ const APP_ID: u32 = 3711050;
 /// The port `beatermp` listens on unless told otherwise.
 const DEFAULT_PORT: u16 = 6237;
 
-const USAGE: &str = "usage: beatermp-steam [--port N] [--friends-only] [--data-file PATH]
+/// Shown in the client's Server list; the game's host writes its own
+/// "Server name:" field into the lobby's `name` key.
+const DEFAULT_NAME: &str = "beatermp";
+
+const USAGE: &str =
+    "usage: beatermp-steam [--port N] [--name NAME] [--friends-only] [--data-file PATH]
   --port N         local beatermp UDP port to relay to (default 6237)
+  --name NAME      lobby name shown in the in-game Server list (default beatermp)
   --friends-only   create a friends-only lobby instead of a public one
   --data-file PATH append one JSON line per lobby/identity event to PATH
 
@@ -117,18 +123,22 @@ struct RuntimePeer {
 fn main() {
     let mut port = DEFAULT_PORT;
     let mut friends_only = false;
+    let mut name = DEFAULT_NAME.to_string();
     let mut data_file: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => {
-                port = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("--port needs a number\n{USAGE}");
-                        std::process::exit(2);
-                    })
+                port = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--port needs a number\n{USAGE}");
+                    std::process::exit(2);
+                })
+            }
+            "--name" => {
+                name = args.next().unwrap_or_else(|| {
+                    eprintln!("--name needs a value\n{USAGE}");
+                    std::process::exit(2);
+                })
             }
             "--friends-only" => friends_only = true,
             "--data-file" => {
@@ -161,17 +171,30 @@ fn main() {
         LobbyType::Public
     };
     let (tx, rx) = mpsc::channel();
-    client.matchmaking().create_lobby(lobby_type, 6, move |res| {
-        let _ = tx.send(res);
-    });
+    client
+        .matchmaking()
+        .create_lobby(lobby_type, 6, move |res| {
+            let _ = tx.send(res);
+        });
     let lobby = wait_for(&client, &rx, Duration::from_secs(10)).unwrap_or_else(|| {
         eprintln!("Steam did not create a lobby in time");
         std::process::exit(1);
     });
+    // The Server list renders GetLobbyData(lobby, "name") and falls back to
+    // "Unnamed server"; a real host writes its "Server name:" field here.
+    if !client.matchmaking().set_lobby_data(lobby, "name", &name) {
+        eprintln!(
+            "warning: Steam rejected the lobby name; the Server list will say \"Unnamed server\""
+        );
+    }
     println!(
-        "beatermp-steam: lobby {} is {} and listed for AppID {APP_ID} as {}; relaying to 127.0.0.1:{port}",
+        "beatermp-steam: lobby {} is {} and listed for AppID {APP_ID} as {name:?} owned by {}; relaying to 127.0.0.1:{port}",
         lobby.raw(),
         if friends_only { "friends-only" } else { "public" },
+        me.raw(),
+    );
+    println!(
+        "beatermp-steam: clients ConnectP2P to {}, so the joining game must run on a different Steam account",
         me.raw(),
     );
     log.line(&[
@@ -179,7 +202,12 @@ fn main() {
         ("event", "lobby_created".into()),
         ("lobby", lobby.raw().to_string()),
         ("host_steam_id", me.raw().to_string()),
+        ("name", name.clone()),
     ]);
+
+    // Relay access is what carries P2P connections between peers that cannot
+    // reach each other directly; ask for it before anyone dials in.
+    client.networking_utils().init_relay_network_access();
 
     let sockets = client.networking_sockets();
     let listen = sockets
@@ -217,7 +245,10 @@ fn main() {
                                 ("ts", unix_seconds().to_string()),
                                 ("event", "connect".into()),
                                 ("peer", id.to_string()),
-                                ("steam_id", steam_id.map(|s| s.to_string()).unwrap_or_default()),
+                                (
+                                    "steam_id",
+                                    steam_id.map(|s| s.to_string()).unwrap_or_default(),
+                                ),
                             ]);
                             peers.insert(
                                 id,
@@ -284,7 +315,9 @@ fn main() {
                             }
                         }
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
                         break;
                     }
                     Err(e) => {
