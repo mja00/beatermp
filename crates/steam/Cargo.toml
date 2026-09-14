@@ -1,0 +1,22 @@
+[package]
+name = "beatermp-steam"
+description = "Steam lobby + P2P bridge for beatermp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# The Steam runtime pulls in steamworks (and its bundled Steamworks SDK); the
+# default build stays Steam-free and only the translation library compiles.
+steam = ["dep:steamworks"]
+
+[dependencies]
+beatermp-codec.workspace = true
+steamworks = { version = "0.13", optional = true }
+
+[[bin]]
+name = "beatermp-steam"
+path = "src/main.rs"
+required-features = ["steam"]

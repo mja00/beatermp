@@ -105,6 +105,28 @@ results table has no empty row. CPU opponents are not supported: a real host
 spawns them as extra SpawnCars (leading `u32 1`) and simulates them itself,
 which needs the game's physics.
 
+## In-game Server list (Steam)
+
+The game's Server list is a Steam Matchmaking lobby list; the dead
+`209.250.240.105:4321` master is only for room codes and NAT punch. To make a
+`beatermp` host discoverable, `beatermp-steam` (`crates/steam`) creates a
+public or friends-only lobby as AppID 3711050 plus a P2P listen socket, then
+relays Steam peers to a local `beatermp`, translating between the game's Steam
+transport (raw `NetworkEvent`s, no `Frame` envelope) and beatermp's UDP frames:
+
+```sh
+./target/release/beatermp --name "My Server" &
+cargo run -p beatermp-steam --features steam -- --data-file players.jsonl
+```
+
+It needs the Steam client running and logged in with an account that owns
+BeaterCore (the initialisation is opt-in; the default workspace build is
+Steam-free). `--data-file` appends one JSON line per lobby/identity event:
+lobby creation, connects and disconnects, and each client's name and
+enabled-mod count. The recovered lobby-list and transport contract is in
+`docs/notes/steam-browser.md`. A lobby appearing in the client's Server list
+can only be verified with a live Steam session, so that check is manual.
+
 ## Protocol
 
 Everything is bincode-style little endian. Strings are `u64 len` + UTF-8.
