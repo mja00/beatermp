@@ -71,15 +71,14 @@ const DEFAULT_MAP: &str = "forest_long";
 /// files by `tools/re/spawns.py` so the server needs no game install.
 const MAPS_TABLE: &str = include_str!("../maps.txt");
 
+/// Off-grid parking poses for the phantom host, one row per grid slot, from
+/// `tools/re/parking.py`. A map/variant missing here falls back to the grid.
+const PARKING_TABLE: &str = include_str!("../parking.txt");
+
 /// A car at rest sits this far above its spawn point's y on flat ground
 /// (captured host: 0.754 over a spawn at 0.0). Spawning there instead of in
 /// the terrain avoids a physics pop at the grid.
 const SPAWN_LIFT: f32 = 0.75;
-
-/// How far below its grid slot the phantom host car is parked. Deep enough to
-/// be under any terrain, so the host car never blocks a racer; keeping its
-/// x/z on the grid leaves a 2D minimap unchanged.
-const HOST_PARK_DEPTH: f32 = 5000.0;
 
 /// `AvatarState` as every real host and client has sent it; opaque here.
 const AVATAR: [u8; 5] = [0; 5];
@@ -112,7 +111,7 @@ const HOST_ENTITY: u32 = 0x540;
 /// The host car's physics snapshot at the grid, captured verbatim
 /// (`CarStateBroadcast` for `HOST_ENTITY`, sitting still). Streamed at 20 Hz
 /// during a race so clients see a parked host car; its pose is patched to the
-/// current map's slot 0 in `start_race`.
+/// current map's host grid slot in `start_race`.
 const HOST_CAR_STATE_HEX: &str = concat!(
     "0c000000ffffffff010000004005000001000000",
     "0000000092fc7fbf0000000021aa273ca00f8e42bb3f3f3f00007843000000005c58b6be",
@@ -233,21 +232,33 @@ impl Map {
         format!("{} | {}", self.name, VARIANTS[self.variant as usize - 1])
     }
 
-    /// Grid placement for `slot` (host is 0). A lobby larger than the grid
-    /// wraps onto the first points; the game itself caps lobbies per map.
+    /// A lobby larger than the grid wraps onto the first points; the game
+    /// itself caps lobbies per map.
     fn grid_pose(&self, slot: usize) -> Pose {
         self.spawns[slot % self.spawns.len()]
     }
 
-    /// Where the phantom host car is parked: the grid slot *after* every racer
-    /// (the host nominally takes the last slot), moved straight down. x/z stay
-    /// on the grid (so a 2D minimap is unaffected) while the car sits far under
-    /// the terrain, out of the racing line all race -- a car parked *on* the
-    /// grid would still be driven into every lap.
-    fn parking_pose(&self, slot: usize) -> Pose {
-        let mut pose = self.grid_pose(slot);
-        pose[5] -= HOST_PARK_DEPTH;
-        pose
+    /// Where the phantom host parks when `slot` cars race: an off-road
+    /// shoulder pose at normal height from [`PARKING_TABLE`], or the next
+    /// grid slot when the scene has no computed shoulder. Parking far under
+    /// the terrain corrupted client physics (NaN poses, instant finishes).
+    fn parking_pose(&self, slot: usize) -> Option<Pose> {
+        let variant = VARIANTS[self.variant as usize - 1];
+        let mut lines = PARKING_TABLE.lines();
+        let count: usize = loop {
+            let header = lines.next()?;
+            let mut words = header.split(' ');
+            if words.next() == Some(self.name.as_str()) && words.next() == Some(variant) {
+                break words.next()?.parse().ok()?;
+            }
+        };
+        let line = lines.nth(slot % count)?;
+        let mut pose: Pose = [0.0; 7];
+        for (word, slot) in line.split(' ').zip(pose.iter_mut()) {
+            *slot = word.parse().expect("parking.txt is generated");
+        }
+        pose[5] += SPAWN_LIFT;
+        Some(pose)
     }
 }
 
@@ -376,8 +387,8 @@ struct Server {
     last_finish_time: f64,
     /// When to send `RaceEnd`, once finishing is settled.
     race_end_at: Option<Instant>,
-    /// `CarStateBroadcast` payload for the phantom host car, posed at slot 0
-    /// of the current map; its clock and grid flag are patched per send.
+    /// `CarStateBroadcast` payload for the phantom's grid slot on the current
+    /// map; its clock and grid flag are patched per send.
     host_state: Vec<u8>,
     /// When `RaceGo` went out; the grid flag clears 3 s later like a real car.
     race_go_at: Option<Instant>,
@@ -417,19 +428,21 @@ impl Server {
         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
         let start = encode_start_race(&self.map().name, self.map().variant, &self.settings);
         let host_garage = decode_hex(HOST_GARAGE_HEX);
-        // Clients take the front grid slots; the phantom host nominally takes
-        // the last one, parked under the terrain. A client only accepts a race
-        // with a host car present, but nothing needs it on the racing line.
+        // Park the phantom on a computed off-road shoulder when the scene has
+        // one (falling back to the next grid slot); burying its chassis left
+        // detached wheels and NaN'd the client's physics state.
         let client_count = self.clients.values().filter(|c| c.garage.is_some()).count();
-        let host_pose = self.map().parking_pose(client_count);
+        let host_pose = self
+            .map()
+            .parking_pose(client_count)
+            .unwrap_or_else(|| self.map().grid_pose(client_count));
         let mut spawns = vec![encode_spawn_car(
             PlayerId::HOST,
             HOST_ENTITY,
             &host_garage,
             &host_pose,
         )];
-        // The captured state has the capture's grid position baked in; patch in
-        // the parked pose so the streamed host stays off the track too.
+        // Spawn and streamed state must agree on the host's grid pose.
         let mut host_state = decode_hex(HOST_CAR_STATE_HEX);
         let pose_at = host_state.len() - CAR_STATE_LEN;
         for (i, f) in host_pose.iter().enumerate() {
@@ -1247,5 +1260,44 @@ fn main() {
     if let Err(e) = server.run() {
         eprintln!("server error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The baked parking table must line up with the grid table it was
+    /// generated from: same slot count per block, finite poses, and every
+    /// pose actually moved off its grid slot. A scene without a block falls
+    /// back to the grid.
+    #[test]
+    fn parking_table_matches_grid_table() {
+        let mut parked = 0;
+        for spec in Map::names() {
+            let map = Map::load(&spec).unwrap();
+            let Some(first) = map.parking_pose(0) else {
+                continue;
+            };
+            parked += 1;
+            for slot in 0..map.spawns.len() {
+                let pose = map.parking_pose(slot).unwrap();
+                let grid = map.grid_pose(slot);
+                assert!(pose.iter().all(|v| v.is_finite()), "{spec} slot {slot}");
+                // The generator prints 6 significant digits.
+                for i in [0, 1, 2, 3, 5] {
+                    assert!(
+                        (pose[i] - grid[i]).abs() < 1e-3,
+                        "{spec} slot {slot} keeps grid rotation and height"
+                    );
+                }
+                let off = ((pose[4] - grid[4]).powi(2) + (pose[6] - grid[6]).powi(2)).sqrt();
+                assert!(off >= 4.9, "{spec} slot {slot} only {off} m off the grid");
+            }
+            // Blocks wrap like the grid does.
+            assert_eq!(map.parking_pose(map.spawns.len()), Some(first));
+        }
+        assert!(parked > 0);
+        assert!(Map::load("oval").unwrap().parking_pose(0).is_none());
     }
 }

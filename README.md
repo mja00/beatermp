@@ -97,10 +97,16 @@ lobby minimap follows the rotation. `--laps`, `--night` and `--rain` set the
 race settings a real host picks in its Race Settings panel.
 
 Limits: the host car is a parked phantom. Clients take the front grid slots;
-the host nominally takes the last one but is spawned far below the terrain, so
-it is never on the racing line (a car parked on the grid would be driven into
-every lap). A client only accepts a race with a host car present, so it must
-exist. Its car state is a captured constant with the pose, grid flag and clock
+the host parks on a shoulder beside the next slot, computed by
+`tools/re/parking.py` from the scene's path waypoints and widths and baked
+into `crates/server/parking.txt`, so it is visible but off the racing line.
+Eight scenes (`oval`, `shore_fun`, `short3`, `swamp`, `test_finish`,
+`winter`, `winter2`, `winter_tiny`) have no clear shoulder within 60 m and
+fall back to the next grid slot, where racers may encounter it on later laps.
+The phantom keeps normal grid height: parking its chassis underground caused
+detached wheels, NaN client physics and immediate zero-time finishes.
+A client requires the host car to be present. Its car state is a captured
+constant with the pose, grid flag and clock
 patched live, and it "finishes" 1 ms behind the last real finisher so the
 results table has no empty row. CPU opponents are not supported: a real host
 spawns them as extra SpawnCars (leading `u32 1`) and simulates them itself,
