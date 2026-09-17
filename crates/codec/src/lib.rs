@@ -83,6 +83,11 @@ pub const CHUNK_SIZE: usize = 450;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Event {
+    /// Both ways, relayed verbatim by the host: one chat line as a `String`.
+    /// A client sends `"{player name}: {text}"` already formatted
+    /// (`NetworkManager::ui_render`, 0x61aa8c), and every receiver pushes the
+    /// string straight into its chat log, so a host can inject its own lines.
+    Chat = 0,
     /// Host -> clients when the host presses Start Race. Body: map name,
     /// variant and race settings.
     StartRace = 1,
@@ -190,6 +195,7 @@ pub enum Event {
 impl Event {
     pub fn from_u32(v: u32) -> Option<Event> {
         Some(match v {
+            0 => Event::Chat,
             1 => Event::StartRace,
             2 => Event::RaceGo,
             3 => Event::RaceEnd,
@@ -896,20 +902,20 @@ pub fn event_discriminant(payload: &[u8]) -> Result<u32> {
 /// *without* the `PlayerId`, so it is not listed and is relayed unchanged.
 pub fn broadcast_twin(discriminant: u32) -> Option<u32> {
     Some(match discriminant {
-        6 => 7,    // Ready -> PlayerSetStatusBroadcast
-        8 => 9,    // unnamed client request -> its broadcast
-        11 => 12,  // SyncCarState -> SyncCarStateBroadcast
-        16 => 17,  // CarDeriative -> LobbyChangeCarBroadcast
-        19 => 20,  // "no car selected" -> its broadcast
-        25 => 26,  // unnamed
-        27 => 28,  // unnamed
-        29 => 30,  // UpdateAvatarState -> UpdateAvatarStateBroadcast
-        31 => 32,  // UpdateLocation -> UpdateLocationBroadcast
-        39 => 40,  // CarEvent -> CarEventBroadcast
-        41 => 42,  // StopGarageVisit -> StopGarageVisitBroadcast
-        43 => 46,  // PushCartStarted -> PushCartStartedBroadcast
-        44 => 47,  // PushCartMoved -> PushCartMovedBroadcast
-        45 => 48,  // PushCartEnd -> PushCartEndBroadcast
+        6 => 7,   // Ready -> PlayerSetStatusBroadcast
+        8 => 9,   // unnamed client request -> its broadcast
+        11 => 12, // SyncCarState -> SyncCarStateBroadcast
+        16 => 17, // CarDeriative -> LobbyChangeCarBroadcast
+        19 => 20, // "no car selected" -> its broadcast
+        25 => 26, // unnamed
+        27 => 28, // unnamed
+        29 => 30, // UpdateAvatarState -> UpdateAvatarStateBroadcast
+        31 => 32, // UpdateLocation -> UpdateLocationBroadcast
+        39 => 40, // CarEvent -> CarEventBroadcast
+        41 => 42, // StopGarageVisit -> StopGarageVisitBroadcast
+        43 => 46, // PushCartStarted -> PushCartStartedBroadcast
+        44 => 47, // PushCartMoved -> PushCartMovedBroadcast
+        45 => 48, // PushCartEnd -> PushCartEndBroadcast
         _ => return None,
     })
 }
@@ -968,6 +974,21 @@ pub fn encode_lobby_change_map(map: &str, variant: u32) -> Vec<u8> {
     put_string(&mut out, map);
     out.extend_from_slice(&variant.to_le_bytes());
     out
+}
+
+/// Encode an [`Event::Chat`] line.
+pub fn encode_chat(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + text.len());
+    out.extend_from_slice(&(Event::Chat as u32).to_le_bytes());
+    put_string(&mut out, text);
+    out
+}
+
+/// Decode an [`Event::Chat`] line.
+pub fn decode_chat(payload: &[u8]) -> Result<String> {
+    let mut c = Cursor::new(payload);
+    expect_event(&mut c, Event::Chat, "Chat")?;
+    c.string()
 }
 
 /// Encode an [`Event::RaceGo`]; it has no body.

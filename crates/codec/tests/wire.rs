@@ -819,8 +819,8 @@ fn broadcast_twins_insert_the_sender() {
     assert_eq!(broadcast_twin(43), Some(46)); // PushCartStarted
     assert_eq!(broadcast_twin(44), Some(47)); // PushCartMoved
     assert_eq!(broadcast_twin(45), Some(48)); // PushCartEnd
-    // Variant 0 (a String) maps to itself *without* the PlayerId, so a host
-    // relays it unchanged rather than re-tagging it.
+                                              // Variant 0 (a String) maps to itself *without* the PlayerId, so a host
+                                              // relays it unchanged rather than re-tagging it.
     assert_eq!(broadcast_twin(0), None);
     assert_eq!(
         broadcast_twin(4),
@@ -866,4 +866,3 @@ fn disconnect_carries_a_reason() {
     }
     assert!(found > 0, "no Disconnect frame in leave_host.txt");
 }
-

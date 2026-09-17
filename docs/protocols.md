@@ -79,7 +79,7 @@ body verbatim (`codec::broadcast_twin`).
 
 | id | serde name (recovered) | body | direction | Sent |
 |---|---|---|---|---|
-| 0 | (String) | chat string, relayed verbatim | client -> all | rel |
+| 0 | (String) | chat line, relayed verbatim; a client sends `"{name}: {text}"` (`ui_render` 0x61aa8c), `display_chat_system` (0x5ecde0) wraps its own lines in `#{100100230}`...`#{RES}` | client -> all | rel |
 | 1 | (RacePreset) | StartRace: map, `u32 0`, laps, night, rain, variant | host -> all | ord |
 | 2 | (unit) | RaceGo | host -> all | unrel |
 | 3 | (bool) | RaceEnd, only `1` seen | host -> all | ord |

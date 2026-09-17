@@ -40,14 +40,14 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beatermp_codec::{
-    broadcast_twin, broadcast_verbatim, clock_of, decode_crossed_finish, decode_disconnect,
-    decode_ready, decode_visit_request, encode, encode_car_crossed_finish, encode_clock,
-    encode_garage_commit, encode_garage_visit_broadcast, encode_lobby_change_map,
-    encode_location_in_garage, encode_player_left, encode_race_end, encode_race_go,
-    encode_ready_broadcast, encode_spawn_car, encode_start_race, encode_visit_garage_response,
-    encode_with_sender, encode_with_sender_disc, event_discriminant, event_kind, parse, CarState,
-    Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId, PlayerInfo, Pose, RaceSettings,
-    ServerInfo, CHUNK_SIZE, GREETING_ID,
+    broadcast_twin, broadcast_verbatim, clock_of, decode_chat, decode_crossed_finish,
+    decode_disconnect, decode_ready, decode_visit_request, encode, encode_car_crossed_finish,
+    encode_chat, encode_clock, encode_garage_commit, encode_garage_visit_broadcast,
+    encode_lobby_change_map, encode_location_in_garage, encode_player_left, encode_race_end,
+    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
+    encode_visit_garage_response, encode_with_sender, encode_with_sender_disc, event_discriminant,
+    event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId,
+    PlayerInfo, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -168,19 +168,34 @@ const VARIANTS: [&str; 5] = [
     "TimeAttackReverse",
 ];
 
-/// A raceable scene variant and where its cars start.
+/// Chat prefix a real client uses for its own system lines
+/// (`SharedData::display_chat_system`, 0x5ecde0): an inline colour tag the
+/// chat renderer understands, closed by `#{RES}`.
+const CHAT_SYSTEM_COLOR: &str = "#{100100230}";
+const CHAT_RESET: &str = "#{RES}";
+
+/// Chat lines starting with this are commands for the server, not banter.
+const COMMAND_PREFIX: char = '!';
+
+/// A raceable scene variant, where its cars start, and how long its race is.
 struct Map {
     name: String,
     /// 1-based index into [`VARIANTS`].
     variant: u32,
     spawns: Vec<Pose>,
+    /// Laps for this entry of the rotation; `None` takes the server default.
+    laps: Option<u32>,
 }
 
 impl Map {
-    /// Look `spec` (`name` or `name:variant`, variant case-insensitive) up in
+    /// Look `spec` (`name[:variant][@laps]`, variant case-insensitive) up in
     /// the baked table. Slots are handed out in the scene's own spawn-point
     /// order, which is also what a real host appeared to do.
     fn load(spec: &str) -> Option<Map> {
+        let (spec, laps) = match spec.split_once('@') {
+            Some((spec, laps)) => (spec, Some(laps.parse().ok().filter(|n| *n > 0)?)),
+            None => (spec, None),
+        };
         let (name, variant_name) = spec.split_once(':').unwrap_or((spec, "Default"));
         let variant = VARIANTS
             .iter()
@@ -209,6 +224,7 @@ impl Map {
             name: name.to_string(),
             variant,
             spawns,
+            laps,
         })
     }
 
@@ -306,6 +322,9 @@ struct Client {
     visitors: Vec<SocketAddr>,
     /// Last avatar-state relay; a real host forwards ~100 Hz input at ~20 Hz.
     last_avatar: Instant,
+    /// Rotation index this player wants raced next, from `!vote`. Dies with
+    /// the client, so a leaver's vote never counts.
+    vote: Option<usize>,
 }
 
 impl Client {
@@ -329,6 +348,7 @@ impl Client {
             inbound: HashMap::new(),
             visitors: Vec::new(),
             last_avatar: Instant::now(),
+            vote: None,
         }
     }
 
@@ -365,6 +385,12 @@ fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// `m:ss.mmm`, the way the game's own results table shows a race time.
+fn format_race_time(seconds: f64) -> String {
+    let minutes = (seconds / 60.0).floor();
+    format!("{minutes}:{:06.3}", seconds - minutes * 60.0)
+}
+
 struct Server {
     socket: UdpSocket,
     /// Name shown over the host's car in the lobby.
@@ -372,7 +398,8 @@ struct Server {
     /// Maps to race, in order; `map_index` is the one the lobby is on.
     maps: Vec<Map>,
     map_index: usize,
-    /// Laps, night and rain for every race.
+    /// Night, rain and the default lap count; a rotation entry may override
+    /// the laps.
     settings: RaceSettings,
     clients: HashMap<SocketAddr, Client>,
     next_client_id: u32,
@@ -418,6 +445,219 @@ impl Server {
         &self.maps[self.map_index]
     }
 
+    /// Settings for a race on rotation entry `index`.
+    fn settings_for(&self, index: usize) -> RaceSettings {
+        RaceSettings {
+            laps: self.maps[index].laps.unwrap_or(self.settings.laps),
+            ..self.settings
+        }
+    }
+
+    /// `name | Variant (N laps)`, for chat and logs.
+    fn describe(&self, index: usize) -> String {
+        let laps = self.settings_for(index).laps;
+        let plural = if laps == 1 { "" } else { "s" };
+        format!("{} ({laps} lap{plural})", self.maps[index].label())
+    }
+
+    /// The rotation entry the next race will run on: the lobby's map, or
+    /// during a race whatever `end_race` will switch to.
+    fn upcoming(&self) -> usize {
+        if !self.racing {
+            return self.map_index;
+        }
+        self.vote_leader()
+            .map_or((self.map_index + 1) % self.maps.len(), |(index, _)| index)
+    }
+
+    /// Votes per rotation entry from everyone in the lobby.
+    fn tally(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.maps.len()];
+        for c in self.clients.values().filter(|c| c.garage.is_some()) {
+            if let Some(index) = c.vote {
+                counts[index] += 1;
+            }
+        }
+        counts
+    }
+
+    /// The rotation entry with the most votes and its count, if anyone
+    /// voted; a tie goes to the earlier entry.
+    fn vote_leader(&self) -> Option<(usize, usize)> {
+        let counts = self.tally();
+        let (index, &n) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, n)| (**n, std::cmp::Reverse(*i)))?;
+        (n > 0).then_some((index, n))
+    }
+
+    /// A rotation entry named by 1-based number or by a unique
+    /// case-insensitive fragment of its label; `Err` carries the reason.
+    fn find_map(&self, query: &str) -> Result<usize, String> {
+        if let Ok(n) = query.parse::<usize>() {
+            return (1..=self.maps.len())
+                .contains(&n)
+                .then_some(n - 1)
+                .ok_or_else(|| format!("No map number {n}; see !maps"));
+        }
+        let query = query.to_ascii_lowercase();
+        let matches: Vec<usize> = (0..self.maps.len())
+            .filter(|&i| self.maps[i].label().to_ascii_lowercase().contains(&query))
+            .collect();
+        match matches.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(format!("No map matches {query:?}; see !maps")),
+            _ => Err(format!(
+                "{} maps match {query:?}; vote by number, see !maps",
+                matches.len()
+            )),
+        }
+    }
+
+    /// One chat line from the server to `addr`, coloured like a client's own
+    /// system messages.
+    fn say(&mut self, addr: SocketAddr, text: &str) {
+        let line = encode_chat(&format!("{CHAT_SYSTEM_COLOR}{text}{CHAT_RESET}"));
+        self.send_reliable(addr, line, true);
+    }
+
+    /// One chat line from the server to the whole lobby.
+    fn say_all(&mut self, text: &str) {
+        let line = encode_chat(&format!("{CHAT_SYSTEM_COLOR}{text}{CHAT_RESET}"));
+        for addr in self.lobby_peers(None) {
+            self.send_reliable(addr, line.clone(), true);
+        }
+        println!("chat: {text}");
+    }
+
+    /// Move the lobby to rotation entry `index`: LobbyChangeMap so minimaps
+    /// and the client's "Host changed track" line follow, then the lap count,
+    /// which the game never shows. Votes were for this switch, so they reset.
+    fn set_map(&mut self, index: usize) {
+        self.map_index = index;
+        let change = encode_lobby_change_map(&self.map().name, self.map().variant);
+        for addr in self.lobby_peers(None) {
+            self.send_reliable(addr, change.clone(), true);
+        }
+        for c in self.clients.values_mut() {
+            c.vote = None;
+        }
+        let text = format!(
+            "Next race: {}. {COMMAND_PREFIX}vote picks another.",
+            self.describe(index)
+        );
+        self.say_all(&text);
+    }
+
+    /// A chat line from a lobby member: relay it verbatim like a real host,
+    /// then act on it if it is a `!command`. The client already prefixed
+    /// its own name, so that is stripped before looking for the prefix.
+    fn chat(&mut self, from: SocketAddr, payload: Vec<u8>) -> Option<String> {
+        let line = match decode_chat(&payload) {
+            Ok(line) => line,
+            Err(e) => return Some(format!("bad chat from {from}: {e}")),
+        };
+        let c = self.clients.get(&from).filter(|c| c.garage.is_some())?;
+        let text = line
+            .strip_prefix(c.name())
+            .and_then(|rest| rest.strip_prefix(": "))
+            .unwrap_or(&line)
+            .trim();
+        let command = text.strip_prefix(COMMAND_PREFIX).map(str::to_string);
+        let n = self.broadcast_reliable(from, payload);
+        let Some(command) = command else {
+            return Some(format!("chat relayed to {n} peer(s)"));
+        };
+        self.command(from, &command);
+        Some(format!("chat command {command:?} handled"))
+    }
+
+    fn command(&mut self, from: SocketAddr, command: &str) {
+        let (verb, arg) = command.split_once(' ').unwrap_or((command, ""));
+        match verb.to_ascii_lowercase().as_str() {
+            "help" => {
+                // One chat line does not wrap; the full list ran off screen.
+                self.say(from, "!maps shows the rotation, !next the upcoming race");
+                self.say(
+                    from,
+                    "!vote N or !vote <map> picks the next map, !vote shows the tally",
+                );
+            }
+            "maps" | "rotation" => {
+                for index in 0..self.maps.len() {
+                    let mark = if index == self.upcoming() { ">" } else { " " };
+                    let line = format!("{mark}{}. {}", index + 1, self.describe(index));
+                    self.say(from, &line);
+                }
+            }
+            "next" => {
+                let text = if self.racing {
+                    format!(
+                        "Racing {} now; next: {}",
+                        self.map().label(),
+                        self.describe(self.upcoming())
+                    )
+                } else {
+                    format!("Next race: {}", self.describe(self.upcoming()))
+                };
+                self.say(from, &text);
+            }
+            "vote" => self.vote(from, arg.trim()),
+            _ => {
+                let text =
+                    format!("Unknown command {COMMAND_PREFIX}{verb}; try {COMMAND_PREFIX}help");
+                self.say(from, &text);
+            }
+        }
+    }
+
+    /// `!vote` alone shows the tally; with a map it records the vote and
+    /// tells everyone. A majority of the lobby switches the map at once when
+    /// nobody is racing; otherwise the leader wins when the race ends.
+    fn vote(&mut self, from: SocketAddr, target: &str) {
+        if target.is_empty() {
+            let listed: Vec<String> = self
+                .tally()
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(|(i, n)| format!("{} {n}", self.maps[i].label()))
+                .collect();
+            let text = if listed.is_empty() {
+                format!("No votes yet. {COMMAND_PREFIX}vote N or {COMMAND_PREFIX}vote <map> picks the next map; see {COMMAND_PREFIX}maps")
+            } else {
+                format!("Votes: {}", listed.join(", "))
+            };
+            self.say(from, &text);
+            return;
+        }
+        let index = match self.find_map(target) {
+            Ok(index) => index,
+            Err(why) => return self.say(from, &why),
+        };
+        if !self.racing && index == self.map_index {
+            let text = format!("{} is already next", self.maps[index].label());
+            return self.say(from, &text);
+        }
+        let Some(c) = self.clients.get_mut(&from) else {
+            return;
+        };
+        c.vote = Some(index);
+        let name = c.name().to_string();
+        let votes = self.tally()[index];
+        let needed = self.lobby_peers(None).len() / 2 + 1;
+        let text = format!(
+            "{name} voted for {} ({votes}/{needed} needed)",
+            self.maps[index].label()
+        );
+        self.say_all(&text);
+        if !self.racing && votes >= needed {
+            self.say_all("Vote passed.");
+            self.set_map(index);
+        }
+    }
+
     /// Do what a real host does on Start Race: mark the host ready, announce
     /// the race, then spawn one car per participant (host first) into every
     /// client's world, all on the ordered stream.
@@ -426,7 +666,8 @@ impl Server {
     /// the grid gate is satisfied separately by the host's grid confirm.
     fn start_race(&mut self) {
         let host_ready = encode_ready_broadcast(PlayerId::HOST, true);
-        let start = encode_start_race(&self.map().name, self.map().variant, &self.settings);
+        let settings = self.settings_for(self.map_index);
+        let start = encode_start_race(&self.map().name, self.map().variant, &settings);
         let host_garage = decode_hex(HOST_GARAGE_HEX);
         // Park the phantom on a computed off-road shoulder when the scene has
         // one (falling back to the next grid slot); burying its chassis left
@@ -513,13 +754,20 @@ impl Server {
         };
         c.finished = true;
         let id = c.id;
-        println!("{} finished in {:.3} s", c.name(), finish.time);
+        let name = c.name().to_string();
+        println!("{name} finished in {:.3} s", finish.time);
         let relay = encode_car_crossed_finish(id, &finish);
         for addr in self.lobby_peers(Some(from)) {
             self.send_reliable(addr, relay.clone(), false);
         }
         self.first_finish.get_or_insert_with(Instant::now);
         self.last_finish_time = finish.time;
+        let place = self.clients.values().filter(|c| c.finished).count();
+        let text = format!(
+            "{name} finished P{place} in {}",
+            format_race_time(finish.time)
+        );
+        self.say_all(&text);
         self.settle_finish();
     }
 
@@ -572,13 +820,21 @@ impl Server {
         self.racing = false;
         self.first_finish = None;
         self.race_end_at = None;
-        // Rotate for the next race and tell the lobby, so minimaps and the
-        // "Host changed track" chat line match what StartRace will load.
-        self.map_index = (self.map_index + 1) % self.maps.len();
-        let change = encode_lobby_change_map(&self.map().name, self.map().variant);
-        for addr in self.lobby_peers(None) {
-            self.send_reliable(addr, change.clone(), true);
-        }
+        // Rotate for the next race: the vote leader if anyone voted, else the
+        // next entry. `set_map` tells the lobby so minimaps and the "Host
+        // changed track" chat line match what StartRace will load.
+        let next = match self.vote_leader() {
+            Some((index, votes)) => {
+                let text = format!(
+                    "Vote won by {} with {votes} vote(s)",
+                    self.maps[index].label()
+                );
+                self.say_all(&text);
+                index
+            }
+            None => (self.map_index + 1) % self.maps.len(),
+        };
+        self.set_map(next);
         println!("race over: {why}; next map {}", self.map().label());
     }
 
@@ -874,8 +1130,17 @@ impl Server {
                     );
                 }
                 let n = self.broadcast_reliable(from, encode_garage_commit(id, &payload));
+                if joining {
+                    let text = format!(
+                        "Next race: {}. Chat {COMMAND_PREFIX}help for commands.",
+                        self.describe(self.upcoming())
+                    );
+                    self.say(from, &text);
+                }
                 Some(format!("garage state -> committed to {n} peer(s)"))
             }
+
+            Ok(Event::Chat) => self.chat(from, payload),
 
             Ok(Event::CrossedFinish) => {
                 let finish = match decode_crossed_finish(&payload) {
@@ -1180,12 +1445,13 @@ impl Server {
     }
 }
 
-const USAGE: &str = "usage: beatermp [--port N] [--name NAME] [--map MAP[:VARIANT]]... [--laps N] [--night] [--rain] [--list-maps]
+const USAGE: &str = "usage: beatermp [--port N] [--name NAME] [--map MAP[:VARIANT][@LAPS]]... [--laps N] [--night] [--rain] [--list-maps]
   --port N     UDP port (default 6237, the only one unpatched clients reach)
   --name NAME  host name shown in the lobby (default beatermp)
-  --map MAP    map to race, optionally with a variant such as forest_long:reverse;
-               repeat to rotate through several (default forest_long)
-  --laps N     laps per race (default 1)
+  --map MAP    map to race, optionally with a variant and lap count such as
+               forest_long:reverse@3; repeat to rotate through several in that
+               order (default forest_long). Players pick the next one with !vote
+  --laps N     laps for maps without their own count (default 1)
   --night      race at night
   --rain       race in the rain
   --list-maps  print the maps and variants this build knows and exit";
@@ -1247,11 +1513,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    let rotation: Vec<String> = maps.iter().map(Map::label).collect();
+    let rotation: Vec<String> = maps
+        .iter()
+        .map(|m| format!("{} x{}", m.label(), m.laps.unwrap_or(settings.laps)))
+        .collect();
     println!(
-        "beatermp listening on 0.0.0.0:{port} as {name:?}, maps {}, {} lap(s){}{}",
+        "beatermp listening on 0.0.0.0:{port} as {name:?}, rotation {}{}{}",
         rotation.join(", "),
-        settings.laps,
         if settings.night { ", night" } else { "" },
         if settings.rain { ", rain" } else { "" },
     );

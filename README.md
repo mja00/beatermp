@@ -63,7 +63,7 @@ someone must press Start Race on it. Automating that is more `xdotool`.
 
 ```sh
 cargo build --release
-./target/release/beatermp [--port 6237] [--name beatermp] [--map forest_long[:reverse]]... [--laps 1] [--night] [--rain]
+./target/release/beatermp [--port 6237] [--name beatermp] [--map forest_long[:reverse][@3]]... [--laps 1] [--night] [--rain]
 ./target/release/beatermp --list-maps
 ```
 
@@ -86,15 +86,36 @@ mid-race waits in the lobby until the next race. Garage visits work too:
 player it fetches that player's garage through the server, and the visitor's
 avatar, location and return to the hub are relayed to the others.
 
-Maps: `--map` picks any scene and variant the game can race (`name` or
-`name:variant`, variants being default, reverse, alternative, timeattack and
-timeattackreverse where the scene has them; repeat it for a rotation that
-advances after each race). Grid poses come from `crates/server/maps.txt`, which
-`tools/re/spawns.py` extracts per variant from the game's `scene.ron` files, so
-the server needs no game install. After each race the server announces the next
-track with LobbyChangeMap, exactly as a real host's Change Map does, so the
-lobby minimap follows the rotation. `--laps`, `--night` and `--rain` set the
-race settings a real host picks in its Race Settings panel.
+Maps: `--map` picks any scene and variant the game can race (`name`,
+`name:variant` or `name:variant@laps`, variants being default, reverse,
+alternative, timeattack and timeattackreverse where the scene has them).
+Repeat it for a rotation that advances in that order after each race, each
+entry with its own lap count (`@laps`) or the `--laps` default. Grid poses
+come from `crates/server/maps.txt`, which `tools/re/spawns.py` extracts per
+variant from the game's `scene.ron` files, so the server needs no game
+install. After each race the server announces the next track with
+LobbyChangeMap, exactly as a real host's Change Map does, so the lobby minimap
+follows the rotation. `--laps`, `--night` and `--rain` set the race settings a
+real host picks in its Race Settings panel.
+
+Chat (`T` in the lobby or the race): lines are relayed between players as a
+real host does, and the server posts its own in the game's system colour: the
+upcoming track and lap count when a player joins and after every race, and
+each finisher's place and time. Lines starting with `!` are commands:
+
+| command | effect |
+|---|---|
+| `!maps` | the rotation with numbers and lap counts; `>` marks the upcoming race |
+| `!next` | the upcoming race |
+| `!vote N`, `!vote <map>` | vote for the next map by number or a unique fragment of its name |
+| `!vote` | the current tally |
+| `!help` | this list |
+
+Votes are announced to everyone. A majority of the lobby switches the track at
+once while nobody is racing; otherwise the leader (ties to the earlier entry)
+replaces the rotation's next entry when the race ends, and the rotation
+continues from there. Votes reset whenever the track changes and die with the
+player who cast them.
 
 Limits: the host car is a parked phantom. Clients take the front grid slots;
 the host parks on a shoulder beside the next slot, computed by
@@ -170,6 +191,7 @@ count from `(1, 1)`.
 
 | id | event | direction | body |
 |---|---|---|---|
+| 0 | Chat | both, relayed verbatim | `string`; a client sends `"{name}: {text}"`, `#{RRRGGGBBB}`...`#{RES}` colours a span |
 | 1 | StartRace | host -> all | map name, `u32 0`, `u32 laps`, `u32 night`, `u32 rain`, `u32 variant` (ordered) |
 | 2 | RaceGo | host -> all | empty; the host's own grid confirm, starts the countdown |
 | 3 | RaceEnd | host -> all | `u8 1`; everyone to the results notepad, then the lobby (ordered). Name inferred, not recovered |
