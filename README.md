@@ -117,6 +117,20 @@ replaces the rotation's next entry when the race ends, and the rotation
 continues from there. Votes reset whenever the track changes and die with the
 player who cast them.
 
+Admin: the game sends nothing that identifies a player beyond a free-text
+name, so admin rights come from the console instead. `!reqadmin` prints a
+one-shot code on the server's console; the player who asked redeems it with
+`!admin <code>`. Any other player, or a wrong guess, burns the code. Admins get:
+
+| command | effect |
+|---|---|
+| `!map N`, `!map <map>` | switch the lobby's track now, bypassing the vote |
+| `!laps N` | lap count for the upcoming race's rotation entry |
+| `!start` | start the race without waiting for everyone to ready up |
+| `!kick <name>` | remove the one player whose name contains the fragment |
+
+Admin rights last until that player disconnects.
+
 Limits: the host car is a parked phantom. Clients take the front grid slots;
 the host parks on a shoulder beside the next slot, computed by
 `tools/re/parking.py` from the scene's path waypoints and widths and baked

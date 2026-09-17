@@ -35,6 +35,7 @@
 //! runs out or the lobby empties.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,12 +43,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use beatermp_codec::{
     broadcast_twin, broadcast_verbatim, clock_of, decode_chat, decode_crossed_finish,
     decode_disconnect, decode_ready, decode_visit_request, encode, encode_car_crossed_finish,
-    encode_chat, encode_clock, encode_garage_commit, encode_garage_visit_broadcast,
-    encode_lobby_change_map, encode_location_in_garage, encode_player_left, encode_race_end,
-    encode_race_go, encode_ready_broadcast, encode_spawn_car, encode_start_race,
-    encode_visit_garage_response, encode_with_sender, encode_with_sender_disc, event_discriminant,
-    event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame, Packet, PlayerId,
-    PlayerInfo, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
+    encode_chat, encode_clock, encode_disconnect, encode_garage_commit,
+    encode_garage_visit_broadcast, encode_lobby_change_map, encode_location_in_garage,
+    encode_player_left, encode_race_end, encode_race_go, encode_ready_broadcast, encode_spawn_car,
+    encode_start_race, encode_visit_garage_response, encode_with_sender, encode_with_sender_disc,
+    event_discriminant, event_kind, parse, CarState, Chunk, ClientInfo, Event, Finish, Frame,
+    Packet, PlayerId, PlayerInfo, Pose, RaceSettings, ServerInfo, CHUNK_SIZE, GREETING_ID,
 };
 
 /// The port the game hardcodes. It is a string literal in the binary, so a
@@ -176,6 +177,9 @@ const CHAT_RESET: &str = "#{RES}";
 
 /// Chat lines starting with this are commands for the server, not banter.
 const COMMAND_PREFIX: char = '!';
+
+/// `DisconnectReason::kick`, sent to a client an admin removes.
+const DISCONNECT_KICK: u32 = 1;
 
 /// A raceable scene variant, where its cars start, and how long its race is.
 struct Map {
@@ -325,6 +329,8 @@ struct Client {
     /// Rotation index this player wants raced next, from `!vote`. Dies with
     /// the client, so a leaver's vote never counts.
     vote: Option<usize>,
+    /// Redeemed a `!reqadmin` code; may run the admin commands.
+    admin: bool,
 }
 
 impl Client {
@@ -349,6 +355,7 @@ impl Client {
             visitors: Vec::new(),
             last_avatar: Instant::now(),
             vote: None,
+            admin: false,
         }
     }
 
@@ -419,6 +426,9 @@ struct Server {
     host_state: Vec<u8>,
     /// When `RaceGo` went out; the grid flag clears 3 s later like a real car.
     race_go_at: Option<Instant>,
+    /// The one outstanding `!reqadmin` code and who asked for it. Printed to
+    /// the console only; redeeming or failing it once consumes it.
+    admin_code: Option<(SocketAddr, String)>,
 }
 
 impl Server {
@@ -438,6 +448,7 @@ impl Server {
             race_end_at: None,
             host_state: Vec::new(),
             race_go_at: None,
+            admin_code: None,
         }
     }
 
@@ -575,6 +586,8 @@ impl Server {
 
     fn command(&mut self, from: SocketAddr, command: &str) {
         let (verb, arg) = command.split_once(' ').unwrap_or((command, ""));
+        let arg = arg.trim();
+        let admin = self.clients.get(&from).is_some_and(|c| c.admin);
         match verb.to_ascii_lowercase().as_str() {
             "help" => {
                 // One chat line does not wrap; the full list ran off screen.
@@ -583,6 +596,14 @@ impl Server {
                     from,
                     "!vote N or !vote <map> picks the next map, !vote shows the tally",
                 );
+                if admin {
+                    self.say(from, "admin: !map <map>, !laps N, !start, !kick <name>");
+                } else {
+                    self.say(
+                        from,
+                        "!reqadmin prints a code on the server console; !admin <code> redeems it",
+                    );
+                }
             }
             "maps" | "rotation" => {
                 for index in 0..self.maps.len() {
@@ -603,13 +624,114 @@ impl Server {
                 };
                 self.say(from, &text);
             }
-            "vote" => self.vote(from, arg.trim()),
+            "vote" => self.vote(from, arg),
+            "reqadmin" => self.request_admin(from),
+            "admin" => self.redeem_admin(from, arg),
+            "map" | "laps" | "start" | "kick" if !admin => {
+                let text = format!("{COMMAND_PREFIX}{verb} needs admin; see {COMMAND_PREFIX}help");
+                self.say(from, &text);
+            }
+            "map" => {
+                if self.racing {
+                    return self.say(from, "Wait for the race to end, or !vote for the next map");
+                }
+                match self.find_map(arg) {
+                    Ok(index) => self.set_map(index),
+                    Err(why) => self.say(from, &why),
+                }
+            }
+            "laps" => {
+                let Some(laps) = arg.parse::<u32>().ok().filter(|n| *n > 0) else {
+                    return self.say(from, "!laps N sets the lap count for the next race");
+                };
+                let index = self.upcoming();
+                self.maps[index].laps = Some(laps);
+                let text = format!("Next race: {}", self.describe(index));
+                self.say_all(&text);
+            }
+            "start" => {
+                if self.racing {
+                    return self.say(from, "A race is already running");
+                }
+                let name = self
+                    .clients
+                    .get(&from)
+                    .map_or("admin", Client::name)
+                    .to_string();
+                self.say_all(&format!("{name} started the race"));
+                self.start_race();
+            }
+            "kick" => self.kick(from, arg),
             _ => {
                 let text =
                     format!("Unknown command {COMMAND_PREFIX}{verb}; try {COMMAND_PREFIX}help");
                 self.say(from, &text);
             }
         }
+    }
+
+    /// `!reqadmin`: mint a one-shot code, print it on the console for whoever
+    /// runs the server to read out, and remember who asked. A new request
+    /// replaces any outstanding code.
+    fn request_admin(&mut self, from: SocketAddr) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let code = format!("{:06}", RandomState::new().hash_one(nanos) % 1_000_000);
+        let name = self.clients.get(&from).map_or("", Client::name).to_string();
+        println!("admin code for {name} ({from}): {COMMAND_PREFIX}admin {code}");
+        self.admin_code = Some((from, code));
+        self.say(
+            from,
+            "Code printed on the server console; redeem with !admin <code>",
+        );
+    }
+
+    /// `!admin <code>`: one attempt per code, and only by the player who
+    /// asked for it, so a code seen in the chat scrollback is worthless.
+    fn redeem_admin(&mut self, from: SocketAddr, code: &str) {
+        let Some((requester, expected)) = self.admin_code.take() else {
+            return self.say(from, "No code outstanding; !reqadmin first");
+        };
+        if requester != from || expected != code {
+            println!("admin code rejected for {from}");
+            return self.say(from, "Wrong code; !reqadmin for a new one");
+        }
+        let Some(c) = self.clients.get_mut(&from) else {
+            return;
+        };
+        c.admin = true;
+        let name = c.name().to_string();
+        println!("admin granted to {name} ({from})");
+        self.say_all(&format!("{name} is now an admin"));
+    }
+
+    /// `!kick <name>`: drop the one lobby member whose name contains the
+    /// fragment, telling it why first.
+    fn kick(&mut self, from: SocketAddr, target: &str) {
+        if target.is_empty() {
+            return self.say(from, "!kick <name> removes a player");
+        }
+        let query = target.to_ascii_lowercase();
+        let matches: Vec<SocketAddr> = self
+            .clients
+            .iter()
+            .filter(|(addr, c)| {
+                **addr != from
+                    && c.garage.is_some()
+                    && c.name().to_ascii_lowercase().contains(&query)
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+        let addr = match matches.as_slice() {
+            [addr] => *addr,
+            [] => return self.say(from, &format!("Nobody here matches {target:?}")),
+            _ => return self.say(from, &format!("{} players match {target:?}", matches.len())),
+        };
+        let name = self.clients[&addr].name().to_string();
+        self.send_reliable(addr, encode_disconnect(DISCONNECT_KICK), true);
+        self.remove_client(addr, "kicked");
+        self.say_all(&format!("{name} was kicked"));
     }
 
     /// `!vote` alone shows the tally; with a map it records the vote and
@@ -1567,5 +1689,73 @@ mod tests {
         }
         assert!(parked > 0);
         assert!(Map::load("oval").unwrap().parking_pose(0).is_none());
+    }
+
+    /// A lobby with two joined clients and no network peer behind them;
+    /// outbound packets only queue as `pending`.
+    fn lobby() -> (Server, SocketAddr, SocketAddr) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let maps = vec![Map::load(DEFAULT_MAP).unwrap()];
+        let mut server = Server::new(socket, "test".into(), maps, RaceSettings::default());
+        let mut addrs = Vec::new();
+        for (id, name) in [(1, "alice"), (2, "bob")] {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 40000 + id).parse().unwrap();
+            let mut c = Client::new(id);
+            c.info = Some(ClientInfo {
+                name: name.into(),
+                trailing: 0,
+            });
+            c.garage = Some(Vec::new());
+            server.clients.insert(addr, c);
+            addrs.push(addr);
+        }
+        (server, addrs[0], addrs[1])
+    }
+
+    /// A code is redeemable once, only by its requester; a wrong guess burns
+    /// it, and admin-only verbs stay locked until then.
+    #[test]
+    fn admin_code_is_single_use_and_bound_to_requester() {
+        let (mut s, alice, bob) = lobby();
+        s.command(alice, "kick bob");
+        assert!(
+            s.clients.contains_key(&bob),
+            "kick before admin must not remove anyone"
+        );
+
+        s.command(alice, "reqadmin");
+        let code = s.admin_code.clone().unwrap().1;
+        s.command(bob, &format!("admin {code}"));
+        assert!(
+            !s.clients[&bob].admin,
+            "another player redeemed alice's code"
+        );
+        assert!(
+            s.admin_code.is_none(),
+            "a failed attempt must burn the code"
+        );
+
+        s.command(alice, &format!("admin {code}"));
+        assert!(!s.clients[&alice].admin, "a burnt code was accepted");
+
+        s.command(alice, "reqadmin");
+        let code = s.admin_code.clone().unwrap().1;
+        s.command(alice, "admin 000000x");
+        assert!(!s.clients[&alice].admin);
+        s.command(alice, "reqadmin");
+        assert_ne!(
+            s.admin_code.as_ref().unwrap().1,
+            code,
+            "codes must not repeat trivially"
+        );
+        let code = s.admin_code.clone().unwrap().1;
+        s.command(alice, &format!("admin {code}"));
+        assert!(s.clients[&alice].admin);
+        assert!(s.admin_code.is_none());
+
+        s.command(alice, "laps 3");
+        assert_eq!(s.settings_for(0).laps, 3);
+        s.command(alice, "kick bob");
+        assert!(!s.clients.contains_key(&bob));
     }
 }

@@ -757,6 +757,15 @@ pub fn decode_disconnect(payload: &[u8]) -> Result<u32> {
     c.u32()
 }
 
+/// Encode an [`Event::Disconnect`] carrying a `DisconnectReason` (see
+/// [`decode_disconnect`]); this server sends `1` (kick) to a client it removes.
+pub fn encode_disconnect(reason: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&(Event::Disconnect as u32).to_le_bytes());
+    out.extend_from_slice(&reason.to_le_bytes());
+    out
+}
+
 /// Encode a [`Event::ReadyBroadcast`] for the given player.
 pub fn encode_ready_broadcast(id: PlayerId, ready: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(13);

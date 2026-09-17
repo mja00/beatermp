@@ -177,7 +177,7 @@ mod tests {
             other => panic!("expected a reliable frame, got {other:?}"),
         };
         assert_eq!(first[0], 0); // kind 0
-        // seq counts from 1 and increments per frame.
+                                 // seq counts from 1 and increments per frame.
         assert_eq!(seq_of(&first), 1);
         assert_eq!(seq_of(&second), 2);
     }
